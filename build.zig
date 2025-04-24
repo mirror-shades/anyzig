@@ -140,11 +140,17 @@ fn addTests(
         test_step.dependOn(&run.step);
     }
 
-    const wrap_exe = b.addExecutable(.{
-        .name = "wrap",
-        .root_source_file = b.path("test/wrap.zig"),
-        .target = b.graph.host,
-    });
+    const test_factory: TestFactory = .{
+        .b = b,
+        .test_step = test_step,
+        .anyzig = anyzig,
+        .wrap_exe = b.addExecutable(.{
+            .name = "wrap",
+            .root_source_file = b.path("test/wrap.zig"),
+            .target = b.graph.host,
+        }),
+        .make_build_steps = opt.make_build_steps,
+    };
 
     inline for (std.meta.fields(ZigRelease)) |field| {
         const zig_version = field.name;
@@ -175,31 +181,27 @@ fn addTests(
             else => {},
         }
 
-        const init_out = blk: {
-            const init = b.addRunArtifact(wrap_exe);
-            init.setName(b.fmt("zig {s} build init", .{zig_version}));
-            init.addArg("--no-input");
-            const out = init.addOutputDirectoryArg("out");
-            init.addArg("nosetup");
-            init.addArtifactArg(anyzig);
-            init.addArg(zig_version);
-            init.addArg(switch (zig_release.getInitKind()) {
-                .simple => "init",
-                .exe_and_lib => "init-exe",
-            });
-            break :blk out;
-        };
+        const init_out = test_factory.add(.{
+            .name = b.fmt("test-{s}-init", .{zig_version}),
+            .input_dir = .no_input,
+            .options = .nosetup,
+            .args = &.{
+                zig_version,
+                switch (zig_release.getInitKind()) {
+                    .simple => "init",
+                    .exe_and_lib => "init-exe",
+                },
+            },
+        }).output_dir;
 
         {
-            const run = b.addRunArtifact(wrap_exe);
-            run.setName(b.fmt("zig {s} version", .{zig_version}));
-            run.addDirectoryArg(init_out);
-            _ = run.addOutputDirectoryArg("out");
-            run.addArg("nosetup");
-            run.addArtifactArg(anyzig);
-            run.addArg("version");
-            run.expectStdOutEqual(comptime zig_release.getVersionOutput() ++ "\n");
-            test_step.dependOn(&run.step);
+            const t = test_factory.add(.{
+                .name = b.fmt("test-{s}-version", .{zig_version}),
+                .input_dir = .{ .path = init_out },
+                .options = .nosetup,
+                .args = &.{"version"},
+            });
+            t.run.expectStdOutEqual(comptime zig_release.getVersionOutput() ++ "\n");
         }
 
         const build_enabled = switch (b.graph.host.result.os.tag) {
@@ -217,35 +219,25 @@ fn addTests(
 
         // TODO: test more than just 'zig build'
         if (build_enabled) {
-            const run = b.addRunArtifact(wrap_exe);
-            run.setName(b.fmt("zig {s} build", .{zig_version}));
-            run.addDirectoryArg(init_out);
-            _ = run.addOutputDirectoryArg("out");
-            run.addArg("nosetup");
-            run.addArtifactArg(anyzig);
-            run.addArg("build");
-            if (opt.make_build_steps) {
-                b.step(b.fmt("test-{s}-build", .{zig_version}), "").dependOn(&run.step);
-            }
-            test_step.dependOn(&run.step);
+            _ = test_factory.add(.{
+                .name = b.fmt("test-{s}-build", .{zig_version}),
+                .input_dir = .{ .path = init_out },
+                .options = .nosetup,
+                .args = &.{"build"},
+            });
         }
     }
 
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     // TODO: finish this test
     if (false) {
-        const run = b.addRunArtifact(wrap_exe);
-        run.setName(b.fmt("bad hash", .{}));
-        run.addArg("--no-input");
-        _ = run.addOutputDirectoryArg("out");
-        run.addArg("badhash");
-        run.addArtifactArg(anyzig);
-        run.addArg("version");
-        //run.expectStdOutEqual("0.13.0\n");
-        if (opt.make_build_steps) {
-            b.step("test-bad-hash", "").dependOn(&run.step);
-        }
-        test_step.dependOn(&run.step);
+        const t = test_factory.add(.{
+            .name = "test-bad-hash",
+            .input_dir = .no_input,
+            .options = .badhash,
+            .args = &.{"version"},
+        });
+        t.run.expectStdOutEqual("0.13.0\n");
     }
 
     {
@@ -259,21 +251,58 @@ fn addTests(
             \\
         );
         {
-            const run = b.addRunArtifact(wrap_exe);
-            run.setName(b.fmt("zon with comment", .{}));
-            run.addDirectoryArg(write_files.getDirectory());
-            _ = run.addOutputDirectoryArg("out");
-            run.addArg("nosetup");
-            run.addArtifactArg(anyzig);
-            run.addArg("version");
-            run.expectStdOutEqual("0.13.0\n");
-            if (opt.make_build_steps) {
-                b.step("test-zon-with-comment", "").dependOn(&run.step);
-            }
-            test_step.dependOn(&run.step);
+            const t = test_factory.add(.{
+                .name = "test-zon-with-comment",
+                .input_dir = .{ .path = write_files.getDirectory() },
+                .options = .nosetup,
+                .args = &.{"version"},
+            });
+            t.run.expectStdOutEqual("0.13.0\n");
         }
     }
 }
+
+const TestAnyzig = struct {
+    output_dir: std.Build.LazyPath,
+    run: *std.Build.Step.Run,
+};
+
+const TestFactory = struct {
+    b: *std.Build,
+    test_step: *std.Build.Step,
+    anyzig: *std.Build.Step.Compile,
+    wrap_exe: *std.Build.Step.Compile,
+    make_build_steps: bool,
+
+    pub fn add(self: *const TestFactory, args: struct {
+        name: []const u8,
+        input_dir: union(enum) {
+            no_input,
+            path: std.Build.LazyPath,
+        },
+        options: enum { nosetup, badhash },
+        args: []const []const u8,
+    }) TestAnyzig {
+        const b = self.b;
+        const run = b.addRunArtifact(self.wrap_exe);
+        run.setName(args.name);
+        switch (args.input_dir) {
+            .no_input => run.addArg("--no-input"),
+            .path => |p| run.addDirectoryArg(p),
+        }
+        const output_dir = run.addOutputDirectoryArg("out");
+        run.addArg(@tagName(args.options));
+        run.addArtifactArg(self.anyzig);
+        for (args.args) |a| {
+            run.addArg(a);
+        }
+        if (self.make_build_steps) {
+            b.step(args.name, "").dependOn(&run.step);
+        }
+        self.test_step.dependOn(&run.step);
+        return .{ .run = run, .output_dir = output_dir };
+    }
+};
 
 const ZigRelease = enum {
     @"0.7.0",
