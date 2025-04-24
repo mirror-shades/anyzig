@@ -209,6 +209,30 @@ pub fn main() !void {
 
     const maybe_command: ?[]const u8 = if (argv_index >= all_args.len) null else all_args[argv_index];
 
+    const build_root_options = blk: {
+        var options: FindBuildRootOptions = .{};
+        switch (build_options.exe) {
+            .zig => {
+                if (maybe_command) |command| {
+                    if (std.mem.eql(u8, command, "build")) {
+                        var index: usize = argv_index + 1;
+                        while (index < all_args.len) : (index += 1) {
+                            const arg = all_args[index];
+                            if (std.mem.eql(u8, arg, "--build-file")) {
+                                if (index == all_args.len) break;
+                                index += 1;
+                                options.build_file = all_args[index];
+                                std.log.info("build file '{s}'", .{options.build_file.?});
+                            }
+                        }
+                    }
+                }
+            },
+            .zls => {},
+        }
+        break :blk options;
+    };
+
     const version: []const u8, const is_init = blk: {
         if (maybe_command) |command| {
             if (std.mem.startsWith(u8, command, "-") and !std.mem.eql(u8, command, "-h") and !std.mem.eql(u8, command, "--help")) {
@@ -228,7 +252,7 @@ pub fn main() !void {
             }
         }
         if (manual_version) |version| break :blk .{ version, false };
-        const build_root = try findBuildRoot(arena, .{}) orelse {
+        const build_root = try findBuildRoot(arena, build_root_options) orelse {
             try std.io.getStdErr().writeAll(
                 "no build.zig to pull a zig version from, you can:\n" ++
                     "  1. run '" ++ exe_str ++ " VERSION' to specify a version\n" ++
@@ -327,7 +351,7 @@ pub fn main() !void {
     }
 
     if (is_init) {
-        const build_root = try findBuildRoot(arena, .{}) orelse @panic("init did not create a build.zig file");
+        const build_root = try findBuildRoot(arena, build_root_options) orelse @panic("init did not create a build.zig file");
         log.info("{}{s}", .{ build_root.directory, build_root.build_zig_basename });
         const zon = try loadBuildZigZon(arena, build_root) orelse {
             const f = try std.fs.cwd().createFile("build.zig.zon", .{});

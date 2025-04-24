@@ -260,6 +260,74 @@ fn addTests(
             t.run.expectStdOutEqual("0.13.0\n");
         }
     }
+
+    {
+        const write_files = b.addWriteFiles();
+        const build_zig_12 = write_files.add(
+            "example-0.12.0/build.zig",
+            @embedFile("test/build.version.zig"),
+        );
+        _ = write_files.add("example-0.12.0/build.zig.zon",
+            \\.{
+            \\    .name = "Test",
+            \\    .version = "0.0.0",
+            \\    .minimum_zig_version = "0.12.0",
+            \\    .paths = .{"."},
+            \\}
+            \\
+        );
+        const build_zig_13 = write_files.add(
+            "example-0.13.0/build.zig",
+            @embedFile("test/build.version.zig"),
+        );
+        _ = write_files.add("example-0.13.0/build.zig.zon",
+            \\.{
+            \\    .name = "Test",
+            \\    .version = "0.0.0",
+            \\    .minimum_zig_version = "0.13.0",
+            \\    .paths = .{"."},
+            \\}
+            \\
+        );
+        {
+            const t = test_factory.add(.{
+                .name = "test-build-file-control-0.12.0",
+                .input_dir = .{ .path = write_files.getDirectory().path(b, "example-0.12.0") },
+                .options = .nosetup,
+                .args = &.{"build"},
+            });
+            t.run.expectStdOutEqual("0.12.0\n");
+        }
+        {
+            const t = test_factory.add(.{
+                .name = "test-build-file-control-0.13.0",
+                .input_dir = .{ .path = write_files.getDirectory().path(b, "example-0.13.0") },
+                .options = .nosetup,
+                .args = &.{"build"},
+            });
+            t.run.expectStdOutEqual("0.13.0\n");
+        }
+        {
+            const t = test_factory.add(.{
+                .name = "test-build-file-0.12.0",
+                .input_dir = .{ .path = write_files.getDirectory().path(b, "example-0.13.0") },
+                .options = .nosetup,
+                .args = &.{ "build", "--build-file" },
+            });
+            t.run.addFileArg(build_zig_12);
+            t.run.expectStdOutEqual("0.12.0\n");
+        }
+        {
+            const t = test_factory.add(.{
+                .name = "test-build-file-0.13.0",
+                .input_dir = .{ .path = write_files.getDirectory().path(b, "example-0.12.0") },
+                .options = .nosetup,
+                .args = &.{ "build", "--build-file" },
+            });
+            t.run.addFileArg(build_zig_13);
+            t.run.expectStdOutEqual("0.13.0\n");
+        }
+    }
 }
 
 const TestAnyzig = struct {
