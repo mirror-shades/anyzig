@@ -152,6 +152,19 @@ fn addTests(
         .make_build_steps = opt.make_build_steps,
     };
 
+    _ = test_factory.add(.{
+        .name = "test-master-version",
+        .input_dir = .no_input,
+        .options = .nosetup,
+        .args = &.{ "master", "version" },
+    });
+    _ = test_factory.add(.{
+        .name = "test-master-init",
+        .input_dir = .no_input,
+        .options = .nosetup,
+        .args = &.{ "master", "init" },
+    });
+
     inline for (std.meta.fields(ZigRelease)) |field| {
         const zig_version = field.name;
         const zig_release: ZigRelease = @enumFromInt(field.value);
