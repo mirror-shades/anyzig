@@ -266,6 +266,32 @@ pub fn main() !void {
                 try showAvailableReleases(arena);
                 std.process.exit(0);
             }
+            if (std.mem.eql(u8, command, "remove")) {
+                if (argv_index + 1 >= all_args.len) {
+                    try std.io.getStdErr().writer().print(
+                        "error: remove command requires a version or 'all'\n",
+                        .{},
+                    );
+                    std.process.exit(0xff);
+                }
+
+                const arg = all_args[argv_index + 1];
+                if (std.mem.eql(u8, arg, "all")) {
+                    try removeAllReleases(arena);
+                    return;
+                }
+
+                const version = VersionSpecifier.parse(arg) orelse {
+                    try std.io.getStdErr().writer().print(
+                        "error: invalid version format '{s}'\n",
+                        .{arg},
+                    );
+                    std.process.exit(0xff);
+                };
+
+                try removeRelease(arena, version.semantic);
+                std.process.exit(0);
+            }
         }
         if (manual_version) |version| break :blk .{ version, false };
         const build_root = try findBuildRoot(arena, build_root_options) orelse {
@@ -273,7 +299,9 @@ pub fn main() !void {
                 "no build.zig to pull a zig version from, you can:\n" ++
                     "  1. run '" ++ exe_str ++ " VERSION' to specify a version\n" ++
                     "  2. run '" ++ exe_str ++ " AVAILABLE' to see all available downloads\n" ++
-                    "  3. run from a directory where a build.zig can be found\n",
+                    "  3. run '" ++ exe_str ++ " REMOVE <version>' to remove a version\n" ++
+                    "  4. run '" ++ exe_str ++ " REMOVE ALL' to remove all versions\n" ++
+                    "  5. run from a directory where a build.zig can be found\n",
             );
             std.process.exit(0xff);
         };
@@ -585,6 +613,83 @@ const DownloadUrl = struct {
         }
     }
 };
+
+fn removeRelease(arena: Allocator, version: SemanticVersion) !void {
+    const app_data_path = try std.fs.getAppDataDir(arena, "anyzig");
+    defer arena.free(app_data_path);
+
+    // Initialize hashstore
+    const hashstore_path = try std.fs.path.join(arena, &.{ app_data_path, "hashstore" });
+    try hashstore.init(hashstore_path);
+
+    // Check if version exists in hashstore
+    const version_name = std.fmt.allocPrint(arena, "{s}-{}", .{ exe_str, version }) catch |e| oom(e);
+    const maybe_hash = try hashstore.find(hashstore_path, version_name);
+
+    if (maybe_hash == null) {
+        try std.io.getStdErr().writer().print(
+            "error: version '{}' is not installed\n",
+            .{version},
+        );
+        std.process.exit(0xff);
+    }
+
+    // Get global cache directory
+    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(arena);
+    var global_cache_directory: Directory = .{
+        .handle = try fs.cwd().makeOpenPath(
+            override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(arena),
+            .{},
+        ),
+        .path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(arena),
+    };
+    defer global_cache_directory.handle.close();
+
+    // Remove from global cache
+    const hash = hashAndPath(maybe_hash.?);
+    try global_cache_directory.handle.deleteTree(hash.path());
+
+    // Remove from hashstore
+    try hashstore.delete(hashstore_path, version_name);
+
+    log.info("removed version '{}'", .{version});
+}
+
+fn removeAllReleases(arena: Allocator) !void {
+    const app_data_path = try std.fs.getAppDataDir(arena, "anyzig");
+    defer arena.free(app_data_path);
+
+    // Initialize hashstore
+    const hashstore_path = try std.fs.path.join(arena, &.{ app_data_path, "hashstore" });
+    try hashstore.init(hashstore_path);
+
+    // Open hashstore directory
+    var dir = try std.fs.cwd().openDir(hashstore_path, .{ .iterate = true });
+    defer dir.close();
+
+    var found_any = false;
+    var it = dir.iterate();
+    while (it.next() catch |err| {
+        log.err("Failed to read hashstore directory: {s}", .{@errorName(err)});
+        return;
+    }) |entry| {
+        if (entry.kind != .file) continue;
+
+        const version_name = entry.name;
+        if (!std.mem.startsWith(u8, version_name, exe_str ++ "-")) continue;
+
+        // Extract version from name (remove prefix)
+        const version_str = version_name[exe_str.len + 1 ..];
+        const version = SemanticVersion.parse(version_str) orelse continue;
+
+        try removeRelease(arena, version);
+        found_any = true;
+    }
+
+    if (!found_any) {
+        log.info("no versions installed", .{});
+    }
+}
 
 fn showAvailableReleases(arena: Allocator) !void {
     const app_data_path = try std.fs.getAppDataDir(arena, "anyzig");
