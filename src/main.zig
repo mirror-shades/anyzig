@@ -396,6 +396,12 @@ pub fn main() !void {
     const versioned_exe = try global_cache_directory.joinZ(arena, &.{ hash.path(), exe_str });
     defer arena.free(versioned_exe);
 
+    // If we just downloaded the version and there are no additional arguments,
+    // assume user wanted to do this and exit more gracefully
+    if (maybe_hash == null and argv_index >= all_args.len) {
+        std.process.exit(0);
+    }
+
     const stay_alive = is_init or (builtin.os.tag == .windows);
 
     if (stay_alive) {
@@ -618,11 +624,9 @@ fn removeRelease(arena: Allocator, version: SemanticVersion) !void {
     const app_data_path = try std.fs.getAppDataDir(arena, "anyzig");
     defer arena.free(app_data_path);
 
-    // Initialize hashstore
     const hashstore_path = try std.fs.path.join(arena, &.{ app_data_path, "hashstore" });
     try hashstore.init(hashstore_path);
 
-    // Check if version exists in hashstore
     const version_name = std.fmt.allocPrint(arena, "{s}-{}", .{ exe_str, version }) catch |e| oom(e);
     const maybe_hash = try hashstore.find(hashstore_path, version_name);
 
@@ -634,7 +638,6 @@ fn removeRelease(arena: Allocator, version: SemanticVersion) !void {
         std.process.exit(0xff);
     }
 
-    // Get global cache directory
     const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(arena);
     var global_cache_directory: Directory = .{
         .handle = try fs.cwd().makeOpenPath(
@@ -645,12 +648,18 @@ fn removeRelease(arena: Allocator, version: SemanticVersion) !void {
     };
     defer global_cache_directory.handle.close();
 
-    // Remove from global cache
+    // Remove from global cache is done first
+    // This is to aid concurrency as it is more likely to fail
     const hash = hashAndPath(maybe_hash.?);
     try global_cache_directory.handle.deleteTree(hash.path());
 
-    // Remove from hashstore
-    try hashstore.delete(hashstore_path, version_name);
+    // Remove from hashstore second
+    // Additional error logging to warn user about possible concurrency issues
+    hashstore.delete(hashstore_path, version_name) catch |err| {
+        log.err("Failed to remove version from hashstore: {s}", .{@errorName(err)});
+        log.err("This is a concurrency issue as the version files were already removed from the global cache", .{});
+        return err;
+    };
 
     log.info("removed version '{}'", .{version});
 }
