@@ -327,7 +327,7 @@ pub fn main() !void {
             const download_index_kind: DownloadIndexKind = .official;
             const index_path = try std.fs.path.join(arena, &.{ app_data_path, download_index_kind.basename() });
             defer arena.free(index_path);
-            try downloadFile(arena, download_index_kind.url(), index_path, &report);
+            try downloadFile(arena, download_index_kind.url(), index_path);
             const index_content = blk: {
                 // since we just downloaded the file, this should always succeed now
                 const file = try std.fs.cwd().openFile(index_path, .{});
@@ -375,14 +375,18 @@ pub fn main() !void {
             }
         }
 
-        const url = try getVersionUrl(arena, app_data_path, semantic_version, json_arch_os, &report);
+        const url = try getVersionUrl(
+            arena,
+            app_data_path,
+            semantic_version,
+            json_arch_os,
+        );
         defer url.deinit(arena);
         const hash = hashAndPath(try cmdFetch(
             gpa,
             arena,
             global_cache_directory,
             url.fetch,
-            &report,
             .{ .debug_hash = false },
         ));
         report.info("downloaded {s} to '{}{s}'", .{ hashstore_name, global_cache_directory, hash.path() });
@@ -410,7 +414,7 @@ pub fn main() !void {
     // assume user wanted to do this and exit more gracefully
     if (maybe_hash == null and argv_index >= all_args.len) {
         Reporting.log("Downloaded successfully", .{});
-        Reporting.log("Run '{s} anyzig' to see how to use it", .{versioned_exe});
+        Reporting.log("Run '{s} anyzig' to see how to use it", .{exe_str});
         std.process.exit(0);
     }
 
@@ -720,7 +724,7 @@ fn showAvailableReleases(arena: Allocator, report: *const Reporting.Reporter) !v
 
     report.info("Finding available releases...", .{});
 
-    downloadFile(arena, download_index_kind.url(), index_path, report) catch |err| {
+    downloadFile(arena, download_index_kind.url(), index_path) catch |err| {
         Reporting.throwError("Failed to download release index: {s}", .{@errorName(err)});
         return error.DownloadFailed;
     };
@@ -830,7 +834,6 @@ fn getVersionUrl(
     app_data_path: []const u8,
     semantic_version: SemanticVersion,
     arch_os: []const u8,
-    report: *const Reporting.Reporter,
 ) !DownloadUrl {
     if (build_options.exe == .zls) return DownloadUrl.initOfficial(std.fmt.allocPrint(
         arena,
@@ -858,7 +861,7 @@ fn getVersionUrl(
             return url;
     }
 
-    try downloadFile(arena, download_index_kind.url(), index_path, report);
+    try downloadFile(arena, download_index_kind.url(), index_path);
     const index_content = blk: {
         // since we just downloaded the file, this should always succeed now
         const file = try std.fs.cwd().openFile(index_path, .{});
@@ -955,8 +958,8 @@ fn hashAndPath(hash: zig.Package.Hash) HashAndPath {
     return result;
 }
 
-fn downloadFile(allocator: Allocator, url: []const u8, out_filepath: []const u8, report: *const Reporting.Reporter) !void {
-    report.info("downloading '{s}' to '{s}'", .{ url, out_filepath });
+fn downloadFile(allocator: Allocator, url: []const u8, out_filepath: []const u8) !void {
+    Reporting.log("downloading '{s}' to '{s}'", .{ url, out_filepath });
 
     const lock_filepath = try std.mem.concat(allocator, u8, &.{ out_filepath, ".lock" });
     defer allocator.free(lock_filepath);
@@ -1067,7 +1070,6 @@ pub fn cmdFetch(
     arena: Allocator,
     global_cache_directory: Directory,
     url: []const u8,
-    report: *const Reporting.Reporter,
     opt: struct {
         debug_hash: bool,
     },
@@ -1131,7 +1133,7 @@ pub fn cmdFetch(
     };
     defer fetch.deinit();
 
-    report.info("downloading '{s}'...", .{url});
+    Reporting.log("downloading '{s}'...", .{url});
     fetch.run() catch |err| switch (err) {
         error.OutOfMemory => {
             Reporting.throwError("out of memory", .{});
