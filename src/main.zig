@@ -32,6 +32,69 @@ pub const std_options: std.Options = .{
 
 const exe_str = @tagName(build_options.exe);
 
+const Verbosity = enum {
+    debug,
+    warn,
+    pub const default: Verbosity = .debug;
+};
+
+const global = struct {
+    var gpa_instance: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    const gpa = gpa_instance.allocator();
+    var arena_instance = std.heap.ArenaAllocator.init(gpa);
+    const arena = arena_instance.allocator();
+
+    var cached_verbosity: ?Verbosity = null;
+    var cached_app_data_dir: ?union(enum) {
+        ok: []const u8,
+        err: anyerror,
+    } = null;
+
+    fn getAppDataDir() ![]const u8 {
+        if (cached_app_data_dir == null) {
+            cached_app_data_dir = if (std.fs.getAppDataDir(arena, "anyzig")) |dir|
+                .{ .ok = dir }
+            else |e|
+                .{ .err = e };
+        }
+        return switch (cached_app_data_dir.?) {
+            .ok => |d| d,
+            .err => |e| e,
+        };
+    }
+};
+
+fn readVerbosityFile() union(enum) {
+    no_app_data_dir,
+    no_file,
+    loaded_from_file: Verbosity,
+} {
+    const app_data_dir = global.getAppDataDir() catch return .no_app_data_dir;
+    const verbosity_path = std.fs.path.join(global.arena, &.{ app_data_dir, "verbosity" }) catch |e| oom(e);
+    defer global.arena.free(verbosity_path);
+    const content = read_file: {
+        const file = std.fs.cwd().openFile(verbosity_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return .no_file,
+            else => |e| std.debug.panic("open '{s}' failed with {s}", .{ verbosity_path, @errorName(e) }),
+        };
+        defer file.close();
+        break :read_file file.readToEndAlloc(global.arena, std.math.maxInt(usize)) catch |err| std.debug.panic(
+            "read '{s}' failed with {s}",
+            .{ verbosity_path, @errorName(err) },
+        );
+    };
+    defer global.arena.free(content);
+    const content_trimmed = std.mem.trimRight(u8, content, &std.ascii.whitespace);
+    if (std.mem.eql(u8, content_trimmed, "debug")) return .{ .loaded_from_file = .debug };
+    if (std.mem.eql(u8, content_trimmed, "warn")) return .{ .loaded_from_file = .warn };
+    std.debug.panic(
+        "file '{s}' had the following unexpected content:\n" ++
+            "---\n{s}\n---\n" ++
+            "we currently only expect the content to be 'debug' or 'warn'",
+        .{ verbosity_path, content },
+    );
+}
+
 fn anyzigLog(
     comptime level: std.log.Level,
     comptime scope: @Type(.enum_literal),
@@ -45,6 +108,25 @@ fn anyzigLog(
         },
         else => |s| "(" ++ @tagName(s) ++ "): " ++ level.asText(),
     });
+
+    check_verbosity: {
+        switch (level) {
+            .err, .warn => break :check_verbosity,
+            .info, .debug => {},
+        }
+        if (global.cached_verbosity == null) {
+            global.cached_verbosity = switch (readVerbosityFile()) {
+                .no_app_data_dir => .debug,
+                .no_file => .default,
+                .loaded_from_file => |v| v,
+            };
+        }
+        switch (global.cached_verbosity.?) {
+            .debug => {},
+            .warn => return,
+        }
+    }
+
     const stderr = std.io.getStdErr().writer();
     var bw = std.io.bufferedWriter(stderr);
     const writer = bw.writer();
@@ -201,13 +283,11 @@ fn determineSemanticVersion(scratch: Allocator, build_root: BuildRoot) !Semantic
 }
 
 pub fn main() !void {
-    var gpa_instance: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    defer _ = gpa_instance.deinit();
-    const gpa = gpa_instance.allocator();
+    defer _ = global.gpa_instance.deinit();
+    const gpa = global.gpa;
 
-    var arena_instance = std.heap.ArenaAllocator.init(gpa);
-    defer arena_instance.deinit();
-    const arena = arena_instance.allocator();
+    defer global.arena_instance.deinit();
+    const arena = global.arena;
 
     const all_args = try std.process.argsAlloc(arena);
     defer arena.free(all_args);
@@ -261,6 +341,12 @@ pub fn main() !void {
                     .{command},
                 );
                 std.process.exit(0xff);
+            }
+            if (std.mem.eql(u8, command, "any")) {
+                if (argv_index + 1 == all_args.len) {
+                    std.process.exit(try anyCommandUsage());
+                }
+                std.process.exit(try anyCommand(all_args[argv_index + 1], all_args[argv_index + 2 ..]));
             }
         }
         if (manual_version) |version| break :blk .{ version, false };
@@ -438,6 +524,54 @@ pub fn main() !void {
         log.err("exec '{s}' failed with {s}", .{ versioned_exe, @errorName(err) });
         process.exit(0xff);
     }
+}
+
+fn anyCommandUsage() !u8 {
+    try std.io.getStdErr().writer().print(
+        "any" ++ @tagName(build_options.exe) ++ " {s} from https://github.com/marler8997/anyzig\n" ++
+            "Here are the anyzig-specific subcommands:\n" ++
+            "  zig any set-verbosity LEVEL    | sets the default system-wide verbosity\n" ++
+            "                                 | accepts 'warn' or 'debug\n" ++
+            "  zig any version                | print the version of anyzig to stdout\n",
+        .{@embedFile("version")},
+    );
+    return 0xff;
+}
+fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
+    if (std.mem.eql(u8, command, "version")) {
+        if (args.len != 0) errExit("the 'version' subcommand does not take any cmdline args", .{});
+        try std.io.getStdOut().writer().print("{s}\n", .{@embedFile("version")});
+        return 0;
+    } else if (std.mem.eql(u8, command, "set-verbosity")) {
+        if (args.len == 0) errExit("missing VERBOSITY (either 'warn' or 'debug')", .{});
+        if (args.len != 1) errExit("too many cmdline args", .{});
+        const level_str = args[0];
+        const level: Verbosity = blk: {
+            if (std.mem.eql(u8, level_str, "warn")) break :blk .warn;
+            if (std.mem.eql(u8, level_str, "debug")) break :blk .debug;
+            errExit("unknown VERBOSITY '{s}', expected 'warn' or 'debug'", .{level_str});
+        };
+        {
+            const app_data_dir = try global.getAppDataDir();
+            const verbosity_path = std.fs.path.join(
+                global.arena,
+                &.{ app_data_dir, "verbosity" },
+            ) catch |e| oom(e);
+            defer global.arena.free(verbosity_path);
+            if (std.fs.path.dirname(verbosity_path)) |dir| {
+                try std.fs.cwd().makePath(dir);
+            }
+            const file = try std.fs.cwd().createFile(verbosity_path, .{});
+            defer file.close();
+            try file.writer().print("{s}\n", .{level_str});
+        }
+        switch (readVerbosityFile()) {
+            .no_app_data_dir => @panic("no app data dir?"),
+            .no_file => @panic("no file after writing it?"),
+            .loaded_from_file => |l| std.debug.assert(l == level),
+        }
+        return 0;
+    } else errExit("unknown zig any '{s}' command", .{command});
 }
 
 const SemanticVersion = struct {

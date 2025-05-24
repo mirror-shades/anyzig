@@ -7,6 +7,16 @@ const Exe = enum { zig, zls };
 pub fn build(b: *std.Build) !void {
     const zig_dep = b.dependency("zig", .{});
 
+    const release_version = try makeCalVersion();
+    const dev_version = b.fmt("{s}-dev", .{release_version});
+    const write_files_version = b.addWriteFiles();
+    const release_version_embed = b.createModule(.{
+        .root_source_file = write_files_version.add("version-dev", &release_version),
+    });
+    const dev_version_embed = b.createModule(.{
+        .root_source_file = write_files_version.add("version-release", dev_version),
+    });
+
     const write = b.addWriteFiles();
     _ = write.addCopyDirectory(zig_dep.path("."), "", .{});
     const root = write.addCopyFile(b.path("zigroot/root.zig"), "src/root.zig");
@@ -23,12 +33,17 @@ pub fn build(b: *std.Build) !void {
     const anyzig = blk: {
         const exe = b.addExecutable(.{
             .name = "zig",
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .single_threaded = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .single_threaded = true,
+                .imports = &.{
+                    .{ .name = "zig", .module = zig_mod },
+                    .{ .name = "version", .module = dev_version_embed },
+                },
+            }),
         });
-        exe.root_module.addImport("zig", zig_mod);
         setBuildOptions(b, exe, .zig);
         const install = b.addInstallArtifact(exe, .{});
         b.getInstallStep().dependOn(&install.step);
@@ -45,12 +60,17 @@ pub fn build(b: *std.Build) !void {
     {
         const exe = b.addExecutable(.{
             .name = "zls",
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .single_threaded = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .single_threaded = true,
+                .imports = &.{
+                    .{ .name = "zig", .module = zig_mod },
+                    .{ .name = "version", .module = dev_version_embed },
+                },
+            }),
         });
-        exe.root_module.addImport("zig", zig_mod);
         setBuildOptions(b, exe, .zls);
         const install = b.addInstallArtifact(exe, .{});
         b.getInstallStep().dependOn(&install.step);
@@ -64,7 +84,7 @@ pub fn build(b: *std.Build) !void {
     }
 
     const test_step = b.step("test", "");
-    addTests(b, anyzig, test_step, .{ .make_build_steps = true });
+    addTests(b, dev_version, anyzig, test_step, .{ .make_build_steps = true });
 
     const zip_dep = b.dependency("zip", .{});
 
@@ -78,7 +98,22 @@ pub fn build(b: *std.Build) !void {
     const ci_step = b.step("ci", "The build/test step to run on the CI");
     ci_step.dependOn(b.getInstallStep());
     ci_step.dependOn(test_step);
-    try ci(b, zig_mod, ci_step, host_zip_exe);
+    try ci(b, &release_version, release_version_embed, zig_mod, ci_step, host_zip_exe);
+}
+
+fn makeCalVersion() ![11]u8 {
+    const now = std.time.epoch.EpochSeconds{ .secs = @intCast(std.time.timestamp()) };
+    const day = now.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    var buf: [11]u8 = undefined;
+    const formatted = try std.fmt.bufPrint(&buf, "v{d}_{d:0>2}_{d:0>2}", .{
+        year_day.year,
+        @intFromEnum(month_day.month),
+        month_day.day_index,
+    });
+    std.debug.assert(formatted.len == buf.len);
+    return buf;
 }
 
 fn setBuildOptions(b: *std.Build, exe: *std.Build.Step.Compile, exe_kind: Exe) void {
@@ -93,6 +128,7 @@ const SharedTestOptions = struct {
 };
 fn addTests(
     b: *std.Build,
+    version: []const u8,
     anyzig: *std.Build.Step.Compile,
     test_step: *std.Build.Step,
     opt: SharedTestOptions,
@@ -151,6 +187,73 @@ fn addTests(
         }),
         .make_build_steps = opt.make_build_steps,
     };
+
+    {
+        const t = test_factory.add(.{
+            .name = "test-any",
+            .input_dir = .no_input,
+            .options = .nosetup,
+            .args = &.{"any"},
+        });
+        t.run.addCheck(.{ .expect_stderr_match = b.fmt(
+            "anyzig {s} from https://github.com/marler8997/anyzig\n",
+            .{version},
+        ) });
+        t.run.addCheck(.{ .expect_stderr_match = "zig any version" });
+        t.run.addCheck(.{ .expect_stderr_match = "zig any set-verbosity" });
+    }
+
+    {
+        const t = test_factory.add(.{
+            .name = "test-any-version",
+            .input_dir = .no_input,
+            .options = .nosetup,
+            .args = &.{ "any", "version" },
+        });
+        t.run.expectStdOutEqual(b.fmt("{s}\n", .{version}));
+    }
+
+    {
+        const t = test_factory.add(.{
+            .name = "test-any-set-verbosity-none",
+            .input_dir = .no_input,
+            .options = .nosetup,
+            .args = &.{ "any", "set-verbosity" },
+        });
+        t.run.expectStdErrEqual("anyzig: error: missing VERBOSITY (either 'warn' or 'debug')\n");
+    }
+
+    {
+        const t = test_factory.add(.{
+            .name = "test-any-set-verbosity-too-many",
+            .input_dir = .no_input,
+            .options = .nosetup,
+            .args = &.{ "any", "set-verbosity", "warn", "debug" },
+        });
+        t.run.expectStdErrEqual("anyzig: error: too many cmdline args\n");
+    }
+
+    {
+        const t = test_factory.add(.{
+            .name = "test-any-set-verbosity-bad",
+            .input_dir = .no_input,
+            .options = .nosetup,
+            .args = &.{ "any", "set-verbosity", "whattheheck" },
+        });
+        t.run.expectStdErrEqual("anyzig: error: unknown VERBOSITY 'whattheheck', expected 'warn' or 'debug'\n");
+    }
+
+    {
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        // TODO: override the appdata directory to run this test
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        _ = test_factory.add(.{
+            .name = "test-any-set-verbosity-warn",
+            .input_dir = .no_input,
+            .options = .nosetup,
+            .args = &.{ "any", "set-verbosity", "warn" },
+        });
+    }
 
     _ = test_factory.add(.{
         .name = "test-master-version",
@@ -415,6 +518,8 @@ const ZigRelease = enum {
 
 fn ci(
     b: *std.Build,
+    release_version: []const u8,
+    release_version_embed: *std.Build.Module,
     zig_mod: *std.Build.Module,
     ci_step: *std.Build.Step,
     host_zip_exe: *std.Build.Step.Compile,
@@ -448,31 +553,41 @@ fn ci(
         ci_step.dependOn(install_exes);
         const zig_exe = b.addExecutable(.{
             .name = "zig",
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .single_threaded = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .single_threaded = true,
+                .imports = &.{
+                    .{ .name = "zig", .module = zig_mod },
+                    .{ .name = "version", .module = release_version_embed },
+                },
+            }),
         });
-        zig_exe.root_module.addImport("zig", zig_mod);
         setBuildOptions(b, zig_exe, .zig);
         install_exes.dependOn(
             &b.addInstallArtifact(zig_exe, .{ .dest_dir = .{ .override = target_dest_dir } }).step,
         );
         const zls_exe = b.addExecutable(.{
             .name = "zls",
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .single_threaded = true,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .single_threaded = true,
+                .imports = &.{
+                    .{ .name = "zig", .module = zig_mod },
+                    .{ .name = "version", .module = release_version_embed },
+                },
+            }),
         });
-        zls_exe.root_module.addImport("zig", zig_mod);
         setBuildOptions(b, zls_exe, .zls);
         install_exes.dependOn(
             &b.addInstallArtifact(zls_exe, .{ .dest_dir = .{ .override = target_dest_dir } }).step,
         );
 
         const target_test_step = b.step(b.fmt("test-{s}", .{ci_target_str}), "");
-        addTests(b, zig_exe, target_test_step, .{
+        addTests(b, release_version, zig_exe, target_test_step, .{
             .make_build_steps = false,
             // This doesn't seem to be working, so we're only adding these tests
             // as a dependency if we see the arch is compatible beforehand
