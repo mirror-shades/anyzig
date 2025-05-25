@@ -38,9 +38,13 @@ jobs:
       - run: |
           zig build ci --summary all
       - if: ${{ matrix.os == 'ubuntu-latest' && matrix.arch == 'x86_64' }}
+        name: getversion
+        id: version
+        run: echo "version=$(cat zig-out/version-release)" >> $GITHUB_OUTPUT
+      - if: ${{ matrix.os == 'ubuntu-latest' && matrix.arch == 'x86_64' }}
         uses: actions/upload-artifact@v4
         with:
-          name: anyzig-archives
+          name: anyzig-${{ steps.version.outputs.version }}-archives
           path: |
             zig-out/anyzig-aarch64-linux.tar.gz
             zig-out/anyzig-aarch64-macos.tar.gz

@@ -10,12 +10,14 @@ pub fn build(b: *std.Build) !void {
     const release_version = try makeCalVersion();
     const dev_version = b.fmt("{s}-dev", .{release_version});
     const write_files_version = b.addWriteFiles();
+    const release_version_file = write_files_version.add("version-release", &release_version);
     const release_version_embed = b.createModule(.{
-        .root_source_file = write_files_version.add("version-dev", &release_version),
+        .root_source_file = release_version_file,
     });
     const dev_version_embed = b.createModule(.{
-        .root_source_file = write_files_version.add("version-release", dev_version),
+        .root_source_file = write_files_version.add("version-dev", dev_version),
     });
+    b.getInstallStep().dependOn(&b.addInstallFile(release_version_file, "version-release").step);
 
     const write = b.addWriteFiles();
     _ = write.addCopyDirectory(zig_dep.path("."), "", .{});
