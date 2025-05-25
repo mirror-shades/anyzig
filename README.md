@@ -13,6 +13,8 @@ $ zig 0.13.0 build-exe myproject.zig
 $ zig 0.14.0-dev.3028+cdc9d65b0 build-exe mynewerproject.zig
 ```
 
+Anyzig also adds a few of its own commands, which can be queried and invoked with `zig any ...`.
+
 # Install
 
 Go to https://marler8997.github.io/anyzig and select your OS/Arch to get a download link and/or instructions to install via the command-line.
