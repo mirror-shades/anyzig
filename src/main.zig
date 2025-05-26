@@ -532,11 +532,13 @@ fn anyCommandUsage() !u8 {
             "Here are the anyzig-specific subcommands:\n" ++
             "  zig any set-verbosity LEVEL    | sets the default system-wide verbosity\n" ++
             "                                 | accepts 'warn' or 'debug\n" ++
-            "  zig any version                | print the version of anyzig to stdout\n",
+            "  zig any version                | print the version of anyzig to stdout\n" ++
+            "  zig any list-installed         | list all installed zig versions\n",
         .{@embedFile("version")},
     );
     return 0xff;
 }
+
 fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, command, "version")) {
         if (args.len != 0) errExit("the 'version' subcommand does not take any cmdline args", .{});
@@ -571,7 +573,60 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
             .loaded_from_file => |l| std.debug.assert(l == level),
         }
         return 0;
+    } else if (std.mem.eql(u8, command, "list-installed")) {
+        try showInstalledReleases();
+        std.process.exit(0);
     } else errExit("unknown zig any '{s}' command", .{command});
+}
+
+fn showInstalledReleases() !void {
+    const app_data_path = try std.fs.getAppDataDir(global.arena, "anyzig");
+    defer global.arena.free(app_data_path);
+
+    const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_path, "hashstore" });
+    try hashstore.init(hashstore_path);
+    defer global.arena.free(hashstore_path);
+
+    const stdout = io.getStdOut().writer();
+    try stdout.print("Installed Zig releases for {s}-{s}:\n", .{ os, arch });
+
+    const master_version_name = std.fmt.allocPrint(global.arena, "{s}-master", .{exe_str}) catch |e| oom(e);
+    defer global.arena.free(master_version_name);
+
+    const is_master_installed = hashstore.find(hashstore_path, master_version_name) catch |err| {
+        log.warn("Failed to check if master is installed: {s}", .{@errorName(err)});
+        return;
+    } != null;
+
+    if (is_master_installed) {
+        try stdout.print("master (installed)\n", .{});
+    }
+
+    var dir = std.fs.cwd().openDir(hashstore_path, .{ .iterate = true }) catch |err| {
+        errExit("Failed to open hashstore directory: {s}", .{@errorName(err)});
+    };
+    defer dir.close();
+
+    var walker = try dir.walk(global.arena);
+    defer walker.deinit();
+
+    var found_any = false;
+    while (try walker.next()) |entry| {
+        if (entry.kind == .file) {
+            const file_name = entry.basename;
+            if (std.mem.startsWith(u8, file_name, exe_str)) {
+                const version_part = file_name[exe_str.len + 1 ..]; // +1 for the '-'
+                if (!std.mem.eql(u8, version_part, "master")) {
+                    try stdout.print("{s}\n", .{version_part});
+                    found_any = true;
+                }
+            }
+        }
+    }
+
+    if (!found_any and !is_master_installed) {
+        log.warn("No installed versions found for {s}-{s}", .{ os, arch });
+    }
 }
 
 const SemanticVersion = struct {
