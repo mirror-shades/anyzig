@@ -628,6 +628,7 @@ fn showInstalledReleases() !void {
     defer global.arena.free(hashstore_path);
 
     const is_master_installed = hashstore.find(hashstore_path, master_version_name) catch |err| {
+        // this warns but continues rather than erroring out
         log.warn("Failed to check if master is installed: {s}", .{@errorName(err)});
         return;
     } != null;
