@@ -666,7 +666,7 @@ fn callZigVersion(exe: []const u8) !void {
     switch (result) {
         .Exited => |code| {
             if (code == 0) {
-                std.io.getStdOut().writer().print("-- {s}\n", .{stdout}) catch |err| {
+                std.io.getStdOut().writer().print("-- {s}", .{stdout}) catch |err| {
                     log.warn("Failed to print zig version: {s}", .{@errorName(err)});
                     return;
                 };
