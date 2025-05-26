@@ -38,26 +38,27 @@ const Verbosity = enum {
     pub const default: Verbosity = .debug;
 };
 
+/// Represents an installed Zig version with its version string and installation path
 const ZigInstall = struct {
     version: []const u8,
     path: []const u8,
 };
 
+/// Context for scanning and processing Zig installations in the global cache
 const HashstoreContext = struct {
-    app_data_path: []const u8,
-    hashstore_path: []const u8,
-    global_cache_path: []const u8,
-    p_dir_path: []const u8,
+    // right now we only search the p directory in the global zig cache
+    // from my experience this is where zig installs are stored
+    // the search should start higher and be deeper if more flexibility is needed
     p_dir: std.fs.Dir,
     hashstore_dir: std.fs.Dir,
+    hashstore_path: []const u8,
+    p_dir_path: []const u8,
 
     fn deinit(self: *HashstoreContext) void {
         self.hashstore_dir.close();
         self.p_dir.close();
-        global.arena.free(self.p_dir_path);
-        global.arena.free(self.global_cache_path);
         global.arena.free(self.hashstore_path);
-        global.arena.free(self.app_data_path);
+        global.arena.free(self.p_dir_path);
     }
 };
 
@@ -602,25 +603,14 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
     } else errExit("unknown zig any '{s}' command", .{command});
 }
 
-fn resolveZigExePath(arena: Allocator, hash_path: []const u8) ![]const u8 {
-    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(arena);
-    const global_cache_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(arena);
-    defer if (override_global_cache_dir) |p| arena.free(p);
-    defer arena.free(global_cache_path);
-
-    const p_dir_path = try std.fs.path.join(arena, &.{ global_cache_path, "p" });
-    defer arena.free(p_dir_path);
-
-    const install_path = try std.fs.path.join(arena, &.{ p_dir_path, hash_path });
-    defer arena.free(install_path);
-
-    const exe_name = if (builtin.os.tag == .windows) "zig.exe" else "zig";
-    return try std.fs.path.join(arena, &.{ install_path, exe_name });
-}
-
+//this is the entry point for displaying releases
 fn showInstalledReleases() !void {
+    // this path is passed to the updateHashstore and initHashstoreContext, reduces code duplication
+    const hashstore_path = try std.fs.path.join(global.arena, &.{ try std.fs.getAppDataDir(global.arena, "anyzig"), "hashstore" });
+    defer global.arena.free(hashstore_path);
+
     // start by verifying all installed versions are in the hashstore
-    const installs = try updateHashstore();
+    const installs = try updateHashstore(hashstore_path);
     defer {
         for (installs) |install| {
             global.arena.free(install.version);
@@ -635,13 +625,8 @@ fn showInstalledReleases() !void {
     const master_version_name = try std.fmt.allocPrint(global.arena, "{s}-master", .{exe_str});
     defer global.arena.free(master_version_name);
 
-    const app_data_path = try std.fs.getAppDataDir(global.arena, "anyzig");
-    defer global.arena.free(app_data_path);
-
-    const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_path, "hashstore" });
-    defer global.arena.free(hashstore_path);
-
     const is_master_installed = hashstore.find(hashstore_path, master_version_name) catch |err| {
+        // this warns but continues rather than erroring out
         log.warn("Failed to check if master is installed: {s}", .{@errorName(err)});
         return;
     } != null;
@@ -671,6 +656,27 @@ fn showInstalledReleases() !void {
     }
 }
 
+// Resolves the full path to the Zig executable for a given hash path
+// used to create an exe path for the callZigVersion function
+fn resolveZigExePath(arena: Allocator, hash_path: []const u8) ![]const u8 {
+    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(arena);
+    const global_cache_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(arena);
+    defer if (override_global_cache_dir) |p| arena.free(p);
+    defer arena.free(global_cache_path);
+
+    const p_dir_path = try std.fs.path.join(arena, &.{ global_cache_path, "p" });
+    defer arena.free(p_dir_path);
+
+    const install_path = try std.fs.path.join(arena, &.{ p_dir_path, hash_path });
+    defer arena.free(install_path);
+
+    const exe_name = if (builtin.os.tag == .windows) "zig.exe" else "zig";
+    return try std.fs.path.join(arena, &.{ install_path, exe_name });
+}
+
+// Executes 'zig version' for a given executable and displays the output
+// prints the version info for the zig install directly
+// uses a "--" prefix to separate the output from name of the install which can overlap
 fn callZigVersion(exe: []const u8) !void {
     var child = std.process.Child.init(&.{ exe, "version" }, global.arena);
     child.stdout_behavior = .Pipe;
@@ -682,12 +688,14 @@ fn callZigVersion(exe: []const u8) !void {
     const result = try child.wait();
     if (result == .Exited and result.Exited == 0) {
         try std.io.getStdOut().writer().print("-- {s}", .{stdout});
+    } else {
+        log.err("Failed to get version information from Zig executable '{s}': {s}", .{ exe, "Failure to call zig version" });
+        return error.VersionCheckFailed;
     }
 }
 
-fn initHashstoreContext() !HashstoreContext {
-    const app_data_path = try std.fs.getAppDataDir(global.arena, "anyzig");
-    const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_path, "hashstore" });
+// Initializes the context for scanning Zig installations in the global cache
+fn initHashstoreContext(hashstore_path: []const u8) !HashstoreContext {
     try hashstore.init(hashstore_path);
 
     const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
@@ -706,21 +714,20 @@ fn initHashstoreContext() !HashstoreContext {
     const hashstore_dir = try std.fs.cwd().openDir(hashstore_path, .{ .iterate = true });
 
     return HashstoreContext{
-        .app_data_path = app_data_path,
-        .hashstore_path = hashstore_path,
-        .global_cache_path = global_cache_path,
-        .p_dir_path = p_dir_path,
         .p_dir = p_dir,
         .hashstore_dir = hashstore_dir,
+        .hashstore_path = hashstore_path,
+        .p_dir_path = p_dir_path,
     };
 }
 
+// Processes a single directory entry to check if it's a Zig installation and updates the installs list
 fn processDirectoryEntry(ctx: *HashstoreContext, dir_name: []const u8, installs: *std.ArrayList(ZigInstall)) !void {
     const full_path = try std.fs.path.join(global.arena, &.{ ctx.p_dir_path, dir_name });
     defer global.arena.free(full_path);
 
     if (!try isZigInstall(full_path)) {
-        log.debug("Not a Zig install: {s}", .{dir_name});
+        log.debug("Directory '{s}' is not a valid Zig installation (missing required files or structure)", .{dir_name});
         return;
     }
 
@@ -753,11 +760,18 @@ fn processDirectoryEntry(ctx: *HashstoreContext, dir_name: []const u8, installs:
     }
 }
 
-fn updateHashstore() ![]ZigInstall {
-    var ctx = try initHashstoreContext();
+// Updates the hashstore with current Zig installations
+// returns a list of all installations found
+// this will also add installs external to anyzig
+// it skips anything it can find in the hashstore already
+// it uses directory names as an entry for unhashed/external installs
+// unhashed/external installs have that directory name as an entry
+fn updateHashstore(hashstore_path: []const u8) ![]ZigInstall {
+    var ctx = try initHashstoreContext(hashstore_path);
     defer ctx.deinit();
 
     var installs = std.ArrayList(ZigInstall).init(global.arena);
+    // ownership is transferred to the slice so we need to clean up manually
     errdefer {
         for (installs.items) |install| {
             global.arena.free(install.version);
@@ -775,16 +789,27 @@ fn updateHashstore() ![]ZigInstall {
     return installs.toOwnedSlice();
 }
 
+// Checks if a directory contains a lib directory and zig executable
+// current zig releases have a lib and a docs directory however certain older
+// zig versions do not have a doc directory so it is ignored here intentionally
+// if verification needs to be increased, use the licence file
 fn isZigInstall(dir_path: []const u8) !bool {
     var dir = try std.fs.cwd().openDir(dir_path, .{});
     defer dir.close();
 
-    // Check for lib directory and zig executable
     const zig_exe = if (builtin.target.os.tag == .windows) "zig.exe" else "zig";
 
-    // Try to access both files, return false if either doesn't exist
-    dir.access("lib", .{}) catch return false;
-    dir.access(zig_exe, .{}) catch return false;
+    // Check for lib directory
+    dir.access("lib", .{}) catch |err| {
+        log.debug("Directory '{s}' is not a Zig installation: missing 'lib' directory: {s}", .{ dir_path, @errorName(err) });
+        return false;
+    };
+
+    // Check for zig executable
+    dir.access(zig_exe, .{}) catch |err| {
+        log.debug("Directory '{s}' is not a Zig installation: missing '{s}' executable: {s}", .{ dir_path, zig_exe, @errorName(err) });
+        return false;
+    };
 
     return true;
 }
