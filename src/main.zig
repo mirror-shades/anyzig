@@ -622,7 +622,8 @@ fn showInstalledReleases() !void {
     }
 
     const stdout = io.getStdOut().writer();
-    try stdout.print("Installed Zig releases for {s}-{s}:\n\n", .{ os, arch });
+    try stdout.print("Installed Zig releases\n", .{});
+    try stdout.print("-------------------------\n", .{});
 
     const master_version_name = try std.fmt.allocPrint(global.arena, "{s}-master", .{exe_str});
     defer global.arena.free(master_version_name);
@@ -695,7 +696,7 @@ fn callZigVersion(exe: []const u8) !void {
 
     const result = try child.wait();
     if (result == .Exited and result.Exited == 0) {
-        try std.io.getStdOut().writer().print("└ {s}", .{stdout});
+        try std.io.getStdOut().writer().print("└ version: {s}", .{stdout});
     } else {
         log.err("Failed to get version information from Zig executable '{s}': {s}", .{ exe, "Failure to call zig version" });
         return error.VersionCheckFailed;
