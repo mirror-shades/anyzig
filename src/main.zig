@@ -38,10 +38,27 @@ const Verbosity = enum {
     pub const default: Verbosity = .debug;
 };
 
-// used to track zig installs
 const ZigInstall = struct {
     version: []const u8,
     path: []const u8,
+};
+
+const HashstoreContext = struct {
+    app_data_path: []const u8,
+    hashstore_path: []const u8,
+    global_cache_path: []const u8,
+    p_dir_path: []const u8,
+    p_dir: std.fs.Dir,
+    hashstore_dir: std.fs.Dir,
+
+    fn deinit(self: *HashstoreContext) void {
+        self.hashstore_dir.close();
+        self.p_dir.close();
+        global.arena.free(self.p_dir_path);
+        global.arena.free(self.global_cache_path);
+        global.arena.free(self.hashstore_path);
+        global.arena.free(self.app_data_path);
+    }
 };
 
 const global = struct {
@@ -663,41 +680,82 @@ fn callZigVersion(exe: []const u8) !void {
     defer global.arena.free(stdout);
 
     const result = try child.wait();
-    switch (result) {
-        .Exited => |code| {
-            if (code == 0) {
-                std.io.getStdOut().writer().print("-- {s}", .{stdout}) catch |err| {
-                    log.warn("Failed to print zig version: {s}", .{@errorName(err)});
-                    return;
-                };
+    if (result == .Exited and result.Exited == 0) {
+        try std.io.getStdOut().writer().print("-- {s}", .{stdout});
+    }
+}
+
+fn initHashstoreContext() !HashstoreContext {
+    const app_data_path = try std.fs.getAppDataDir(global.arena, "anyzig");
+    const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_path, "hashstore" });
+    try hashstore.init(hashstore_path);
+
+    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
+    const global_cache_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
+    if (override_global_cache_dir) |p| global.arena.free(p);
+
+    const p_dir_path = try std.fs.path.join(global.arena, &.{ global_cache_path, "p" });
+
+    log.info("Scanning global cache at '{s}'", .{global_cache_path});
+
+    const p_dir = std.fs.cwd().openDir(p_dir_path, .{ .iterate = true }) catch |err| {
+        log.warn("No 'p' directory in global cache: {s}", .{@errorName(err)});
+        return error.NoPDirectory;
+    };
+
+    const hashstore_dir = try std.fs.cwd().openDir(hashstore_path, .{ .iterate = true });
+
+    return HashstoreContext{
+        .app_data_path = app_data_path,
+        .hashstore_path = hashstore_path,
+        .global_cache_path = global_cache_path,
+        .p_dir_path = p_dir_path,
+        .p_dir = p_dir,
+        .hashstore_dir = hashstore_dir,
+    };
+}
+
+fn processDirectoryEntry(ctx: *HashstoreContext, dir_name: []const u8, installs: *std.ArrayList(ZigInstall)) !void {
+    const full_path = try std.fs.path.join(global.arena, &.{ ctx.p_dir_path, dir_name });
+    defer global.arena.free(full_path);
+
+    if (!try isZigInstall(full_path)) {
+        log.debug("Not a Zig install: {s}", .{dir_name});
+        return;
+    }
+
+    var found_match = false;
+    var hashstore_it = ctx.hashstore_dir.iterate();
+    while (try hashstore_it.next()) |hash_entry| {
+        if (hash_entry.kind == .file) {
+            if (try hashstore.find(ctx.hashstore_path, hash_entry.name)) |stored_hash| {
+                if (std.mem.eql(u8, stored_hash.toSlice(), dir_name)) {
+                    log.debug("Directory name {s} matches hashstore hash in {s}", .{ dir_name, hash_entry.name });
+                    try installs.append(.{
+                        .version = try global.arena.dupe(u8, hash_entry.name[exe_str.len + 1 ..]),
+                        .path = try global.arena.dupe(u8, dir_name),
+                    });
+                    found_match = true;
+                    break;
+                }
             }
-        },
-        else => {},
+        }
+    }
+
+    if (!found_match) {
+        const hashstore_name = try std.fmt.allocPrint(global.arena, "{s}-{s}", .{ exe_str, dir_name });
+        log.debug("Not in hashstore, adding: {s} -> {s}", .{ hashstore_name, dir_name });
+        try hashstore.save(ctx.hashstore_path, hashstore_name, dir_name);
+        try installs.append(.{
+            .version = try global.arena.dupe(u8, dir_name),
+            .path = try global.arena.dupe(u8, dir_name),
+        });
     }
 }
 
 fn updateHashstore() ![]ZigInstall {
-    const app_data_path = try std.fs.getAppDataDir(global.arena, "anyzig");
-    defer global.arena.free(app_data_path);
-
-    const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_path, "hashstore" });
-    try hashstore.init(hashstore_path);
-    defer global.arena.free(hashstore_path);
-
-    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
-    const global_cache_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
-    defer if (override_global_cache_dir) |p| global.arena.free(p);
-    defer global.arena.free(global_cache_path);
-
-    log.info("Scanning global cache at '{s}'", .{global_cache_path});
-
-    // Only look in the 'p' directory
-    const p_dir_path = try std.fs.path.join(global.arena, &.{ global_cache_path, "p" });
-    var p_dir = std.fs.cwd().openDir(p_dir_path, .{ .iterate = true }) catch |err| {
-        log.warn("No 'p' directory in global cache: {s}", .{@errorName(err)});
-        return &[_]ZigInstall{};
-    };
-    defer p_dir.close();
+    var ctx = try initHashstoreContext();
+    defer ctx.deinit();
 
     var installs = std.ArrayList(ZigInstall).init(global.arena);
     errdefer {
@@ -708,49 +766,10 @@ fn updateHashstore() ![]ZigInstall {
         installs.deinit();
     }
 
-    var it = p_dir.iterate();
+    var it = ctx.p_dir.iterate();
     while (try it.next()) |entry| {
-        if (entry.kind == .directory) {
-            const dir_name = entry.name;
-            const full_path = try std.fs.path.join(global.arena, &.{ p_dir_path, dir_name });
-            log.debug("Checking directory: {s}", .{dir_name});
-
-            if (try isZigInstall(full_path)) {
-                // Check if this dir_name matches any hash in the hashstore
-                var hashstore_dir = try std.fs.cwd().openDir(hashstore_path, .{ .iterate = true });
-                defer hashstore_dir.close();
-                var hashstore_it = hashstore_dir.iterate();
-                var found_match = false;
-                while (try hashstore_it.next()) |hash_entry| {
-                    if (hash_entry.kind == .file) {
-                        if (try hashstore.find(hashstore_path, hash_entry.name)) |stored_hash| {
-                            if (std.mem.eql(u8, stored_hash.toSlice(), dir_name)) {
-                                log.debug("Directory name {s} matches hashstore hash in {s}, skipping", .{ dir_name, hash_entry.name });
-                                const version = try global.arena.dupe(u8, hash_entry.name[exe_str.len + 1 ..]);
-                                try installs.append(.{
-                                    .version = version,
-                                    .path = try global.arena.dupe(u8, dir_name),
-                                });
-                                found_match = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (found_match) continue;
-
-                // Add all valid Zig installs, regardless of directory name
-                const hashstore_name = try std.fmt.allocPrint(global.arena, "{s}-{s}", .{ exe_str, dir_name });
-                log.debug("Not in hashstore, adding: {s} -> {s}", .{ hashstore_name, dir_name });
-                try hashstore.save(hashstore_path, hashstore_name, dir_name);
-                try installs.append(.{
-                    .version = try global.arena.dupe(u8, dir_name),
-                    .path = try global.arena.dupe(u8, dir_name),
-                });
-            } else {
-                log.debug("Not a Zig install: {s}", .{dir_name});
-            }
-        }
+        if (entry.kind != .directory) continue;
+        try processDirectoryEntry(&ctx, entry.name, &installs);
     }
 
     return installs.toOwnedSlice();
