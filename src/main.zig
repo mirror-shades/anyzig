@@ -38,6 +38,12 @@ const Verbosity = enum {
     pub const default: Verbosity = .debug;
 };
 
+// used to track zig installs
+const ZigInstall = struct {
+    version: []const u8,
+    path: []const u8,
+};
+
 const global = struct {
     var gpa_instance: std.heap.GeneralPurposeAllocator(.{}) = .{};
     const gpa = gpa_instance.allocator();
@@ -579,25 +585,44 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
     } else errExit("unknown zig any '{s}' command", .{command});
 }
 
+fn resolveZigExePath(arena: Allocator, hash_path: []const u8) ![]const u8 {
+    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(arena);
+    const global_cache_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(arena);
+    defer if (override_global_cache_dir) |p| arena.free(p);
+    defer arena.free(global_cache_path);
+
+    const p_dir_path = try std.fs.path.join(arena, &.{ global_cache_path, "p" });
+    defer arena.free(p_dir_path);
+
+    const install_path = try std.fs.path.join(arena, &.{ p_dir_path, hash_path });
+    defer arena.free(install_path);
+
+    const exe_name = if (builtin.os.tag == .windows) "zig.exe" else "zig";
+    return try std.fs.path.join(arena, &.{ install_path, exe_name });
+}
+
 fn showInstalledReleases() !void {
     // start by verifying all installed versions are in the hashstore
-    updateHashstore() catch |err| {
-        log.warn("Failed to update hashstore: {s}", .{@errorName(err)});
-        return;
-    };
+    const installs = try updateHashstore();
+    defer {
+        for (installs) |install| {
+            global.arena.free(install.version);
+            global.arena.free(install.path);
+        }
+        global.arena.free(installs);
+    }
+
+    const stdout = io.getStdOut().writer();
+    try stdout.print("\nInstalled Zig releases for {s}-{s}:\n\n", .{ os, arch });
+
+    const master_version_name = try std.fmt.allocPrint(global.arena, "{s}-master", .{exe_str});
+    defer global.arena.free(master_version_name);
 
     const app_data_path = try std.fs.getAppDataDir(global.arena, "anyzig");
     defer global.arena.free(app_data_path);
 
     const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_path, "hashstore" });
-    try hashstore.init(hashstore_path);
     defer global.arena.free(hashstore_path);
-
-    const stdout = io.getStdOut().writer();
-    try stdout.print("Installed Zig releases for {s}-{s}:\n", .{ os, arch });
-
-    const master_version_name = try std.fmt.allocPrint(global.arena, "{s}-master", .{exe_str});
-    defer global.arena.free(master_version_name);
 
     const is_master_installed = hashstore.find(hashstore_path, master_version_name) catch |err| {
         log.warn("Failed to check if master is installed: {s}", .{@errorName(err)});
@@ -605,31 +630,22 @@ fn showInstalledReleases() !void {
     } != null;
 
     if (is_master_installed) {
-        try stdout.print("master (installed)\n", .{});
+        try stdout.print("Master ", .{});
+        if (try hashstore.find(hashstore_path, master_version_name)) |master_hash| {
+            const exe = try resolveZigExePath(global.arena, master_hash.toSlice());
+            defer global.arena.free(exe);
+            try callZigVersion(exe);
+        }
     }
 
-    var dir = std.fs.cwd().openDir(hashstore_path, .{ .iterate = true }) catch |err| {
-        errExit("Failed to open hashstore directory: {s}", .{@errorName(err)});
-    };
-    defer dir.close();
-
-    var walker = try dir.walk(global.arena);
-    defer walker.deinit();
-
     var found_any = false;
-    while (try walker.next()) |entry| {
-        if (entry.kind == .file) {
-            const file_name = entry.basename;
-            if (std.mem.startsWith(u8, file_name, exe_str)) {
-                const version_part = file_name[exe_str.len + 1 ..]; // +1 for the '-'
-                if (!std.mem.eql(u8, version_part, "master")) {
-                    // Only show entries that look like semantic versions
-                    if (SemanticVersion.parse(version_part) != null) {
-                        try stdout.print("{s}\n", .{version_part});
-                        found_any = true;
-                    }
-                }
-            }
+    for (installs) |install| {
+        if (!std.mem.eql(u8, install.version, "master")) {
+            try stdout.print("{s}\n", .{install.version});
+            const exe = try resolveZigExePath(global.arena, install.path);
+            defer global.arena.free(exe);
+            try callZigVersion(exe);
+            found_any = true;
         }
     }
 
@@ -638,7 +654,29 @@ fn showInstalledReleases() !void {
     }
 }
 
-fn updateHashstore() !void {
+fn callZigVersion(exe: []const u8) !void {
+    var child = std.process.Child.init(&.{ exe, "version" }, global.arena);
+    child.stdout_behavior = .Pipe;
+    try child.spawn();
+
+    const stdout = try child.stdout.?.reader().readAllAlloc(global.arena, std.math.maxInt(usize));
+    defer global.arena.free(stdout);
+
+    const result = try child.wait();
+    switch (result) {
+        .Exited => |code| {
+            if (code == 0) {
+                std.io.getStdOut().writer().print("-- {s}\n", .{stdout}) catch |err| {
+                    log.warn("Failed to print zig version: {s}", .{@errorName(err)});
+                    return;
+                };
+            }
+        },
+        else => {},
+    }
+}
+
+fn updateHashstore() ![]ZigInstall {
     const app_data_path = try std.fs.getAppDataDir(global.arena, "anyzig");
     defer global.arena.free(app_data_path);
 
@@ -657,19 +695,24 @@ fn updateHashstore() !void {
     const p_dir_path = try std.fs.path.join(global.arena, &.{ global_cache_path, "p" });
     var p_dir = std.fs.cwd().openDir(p_dir_path, .{ .iterate = true }) catch |err| {
         log.warn("No 'p' directory in global cache: {s}", .{@errorName(err)});
-        return;
+        return &[_]ZigInstall{};
     };
     defer p_dir.close();
 
-    var temp_arena = std.heap.ArenaAllocator.init(global.arena);
-    defer temp_arena.deinit();
-    const temp_alloc = temp_arena.allocator();
+    var installs = std.ArrayList(ZigInstall).init(global.arena);
+    errdefer {
+        for (installs.items) |install| {
+            global.arena.free(install.version);
+            global.arena.free(install.path);
+        }
+        installs.deinit();
+    }
 
     var it = p_dir.iterate();
     while (try it.next()) |entry| {
         if (entry.kind == .directory) {
             const dir_name = entry.name;
-            const full_path = try std.fs.path.join(temp_alloc, &.{ p_dir_path, dir_name });
+            const full_path = try std.fs.path.join(global.arena, &.{ p_dir_path, dir_name });
             log.debug("Checking directory: {s}", .{dir_name});
 
             if (try isZigInstall(full_path)) {
@@ -683,6 +726,11 @@ fn updateHashstore() !void {
                         if (try hashstore.find(hashstore_path, hash_entry.name)) |stored_hash| {
                             if (std.mem.eql(u8, stored_hash.toSlice(), dir_name)) {
                                 log.debug("Directory name {s} matches hashstore hash in {s}, skipping", .{ dir_name, hash_entry.name });
+                                const version = try global.arena.dupe(u8, hash_entry.name[exe_str.len + 1 ..]);
+                                try installs.append(.{
+                                    .version = version,
+                                    .path = try global.arena.dupe(u8, dir_name),
+                                });
                                 found_match = true;
                                 break;
                             }
@@ -691,19 +739,22 @@ fn updateHashstore() !void {
                 }
                 if (found_match) continue;
 
-                const hashstore_name = try std.fmt.allocPrint(temp_alloc, "{s}-{s}", .{ exe_str, dir_name });
+                // Add all valid Zig installs, regardless of directory name
+                const hashstore_name = try std.fmt.allocPrint(global.arena, "{s}-{s}", .{ exe_str, dir_name });
                 log.debug("Not in hashstore, adding: {s} -> {s}", .{ hashstore_name, dir_name });
                 try hashstore.save(hashstore_path, hashstore_name, dir_name);
-                log.info("Added {s} to hashstore", .{hashstore_name});
+                try installs.append(.{
+                    .version = try global.arena.dupe(u8, dir_name),
+                    .path = try global.arena.dupe(u8, dir_name),
+                });
             } else {
                 log.debug("Not a Zig install: {s}", .{dir_name});
             }
-            _ = temp_arena.reset(.retain_capacity);
         }
     }
-}
 
-// └
+    return installs.toOwnedSlice();
+}
 
 fn isZigInstall(dir_path: []const u8) !bool {
     var dir = try std.fs.cwd().openDir(dir_path, .{});
