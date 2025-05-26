@@ -623,7 +623,7 @@ fn showInstalledReleases() !void {
 
     const stdout = io.getStdOut().writer();
     try stdout.print("Installed Zig releases\n", .{});
-    try stdout.print("-------------------------\n", .{});
+    try stdout.print("----------------------\n", .{});
 
     const master_version_name = try std.fmt.allocPrint(global.arena, "{s}-master", .{exe_str});
     defer global.arena.free(master_version_name);
