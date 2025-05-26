@@ -307,6 +307,12 @@ fn determineSemanticVersion(scratch: Allocator, build_root: BuildRoot) !Semantic
 }
 
 pub fn main() !void {
+    // this is a workaround for windows not supporting utf-8 by default
+    // it currently allows us to print trees with unicode characters
+    if (builtin.os.tag == .windows) {
+        _ = std.os.windows.kernel32.SetConsoleOutputCP(65001); // UTF-8
+    }
+
     defer _ = global.gpa_instance.deinit();
     const gpa = global.gpa;
 
@@ -678,7 +684,7 @@ fn resolveZigExePath(arena: Allocator, hash_path: []const u8) ![]const u8 {
 
 // Executes 'zig version' for a given executable and displays the output
 // prints the version info for the zig install directly
-// uses a "--" prefix to separate the output from name of the install which can overlap
+// uses a "--" prefix to separate the output from name of the install
 fn callZigVersion(exe: []const u8) !void {
     var child = std.process.Child.init(&.{ exe, "version" }, global.arena);
     child.stdout_behavior = .Pipe;
@@ -689,7 +695,7 @@ fn callZigVersion(exe: []const u8) !void {
 
     const result = try child.wait();
     if (result == .Exited and result.Exited == 0) {
-        try std.io.getStdOut().writer().print("-- {s}", .{stdout});
+        try std.io.getStdOut().writer().print("└ {s}", .{stdout});
     } else {
         log.err("Failed to get version information from Zig executable '{s}': {s}", .{ exe, "Failure to call zig version" });
         return error.VersionCheckFailed;
@@ -754,6 +760,7 @@ fn processDirectoryEntry(ctx: *HashstoreContext, dir_name: []const u8, installs:
     }
 
     if (!found_match) {
+        // uses a prefix to avoid conflicts with anyzig-managed installs
         const hashstore_name = try std.fmt.allocPrint(global.arena, "{s}-ext-{s}", .{ exe_str, dir_name });
         log.debug("Not in hashstore, adding: {s} -> {s}", .{ hashstore_name, dir_name });
         try hashstore.save(ctx.hashstore_path, hashstore_name, dir_name);
