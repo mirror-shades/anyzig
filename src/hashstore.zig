@@ -85,6 +85,40 @@ pub fn delete(hashstore_path: []const u8, name: []const u8) !void {
     };
 }
 
+const ReverseLookup = std.AutoHashMapUnmanaged(
+    zig.Package.Hash,
+    std.ArrayListUnmanaged(anyzig.SemanticVersion),
+);
+pub fn allocReverseLookup(
+    hashstore_path: []const u8,
+    allocator: std.mem.Allocator,
+) !ReverseLookup {
+    var dir = try std.fs.cwd().makeOpenPath(hashstore_path, .{ .iterate = true });
+    defer dir.close();
+    var map: ReverseLookup = .{};
+    var it = dir.iterate();
+    const prefix = anyzig.exe_str ++ "-";
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+        const version_str = entry.name[prefix.len..];
+        const entry_version = anyzig.SemanticVersion.parse(version_str) orelse std.debug.panic(
+            "entry '{s}' contains an invalid version '{s}'",
+            .{ entry.name, version_str },
+        );
+        const hash = (try find(hashstore_path, entry.name)) orelse std.debug.panic(
+            "hashstore entry '{s}' disappeared while iterating?",
+            .{entry.name},
+        );
+        const map_entry = map.getOrPut(allocator, hash) catch |e| oom(e);
+        if (!map_entry.found_existing) {
+            map_entry.value_ptr.* = .{};
+        }
+        map_entry.value_ptr.append(allocator, entry_version) catch |e| oom(e);
+    }
+    return map;
+}
+
 pub fn oom(e: error{OutOfMemory}) noreturn {
     @panic(@errorName(e));
 }

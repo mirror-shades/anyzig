@@ -30,7 +30,7 @@ pub const std_options: std.Options = .{
     .logFn = anyzigLog,
 };
 
-const exe_str = @tagName(build_options.exe);
+pub const exe_str = @tagName(build_options.exe);
 
 const Verbosity = enum {
     debug,
@@ -532,11 +532,13 @@ fn anyCommandUsage() !u8 {
             "Here are the anyzig-specific subcommands:\n" ++
             "  zig any set-verbosity LEVEL    | sets the default system-wide verbosity\n" ++
             "                                 | accepts 'warn' or 'debug\n" ++
-            "  zig any version                | print the version of anyzig to stdout\n",
+            "  zig any version                | print the version of anyzig to stdout\n" ++
+            "  zig any list-installed         | list all versions of zig installed in the global cache\n",
         .{@embedFile("version")},
     );
     return 0xff;
 }
+
 fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, command, "version")) {
         if (args.len != 0) errExit("the 'version' subcommand does not take any cmdline args", .{});
@@ -571,10 +573,99 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
             .loaded_from_file => |l| std.debug.assert(l == level),
         }
         return 0;
+    } else if (std.mem.eql(u8, command, "list-installed")) {
+        if (args.len != 0) errExit("the 'list-installed' subcommand does not take any cmdline args", .{});
+        try listInstalled();
+        return 0;
     } else errExit("unknown zig any '{s}' command", .{command});
 }
 
-const SemanticVersion = struct {
+fn listInstalled() !void {
+    const app_data_dir = try global.getAppDataDir();
+
+    const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_dir, "hashstore" });
+    // no need to free
+    try hashstore.init(hashstore_path);
+    const reverse_lookup = try hashstore.allocReverseLookup(hashstore_path, global.arena);
+
+    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
+    const global_cache_dir_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
+    const p_path = std.fs.path.join(global.arena, &.{ global_cache_dir_path, "p" }) catch |e| oom(e);
+    defer global.arena.free(p_path);
+
+    var p_dir: Directory = .{
+        .handle = try fs.cwd().makeOpenPath(p_path, .{ .iterate = true }),
+        .path = p_path,
+    };
+    defer p_dir.handle.close();
+
+    var it = p_dir.handle.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len > zig.Package.Hash.max_len) continue;
+
+        const hash_from_cache = zig.Package.Hash.fromSlice(entry.name);
+        if (reverse_lookup.get(hash_from_cache)) |versions| {
+            for (versions.items) |version| {
+                try listVersion(p_path, version, entry.name);
+            }
+            continue;
+        }
+
+        // right now all zig distributed archives don't include a build.zig.zon so they
+        // should all start with this
+        if (!std.mem.startsWith(u8, entry.name, "N-V-__8AA")) continue;
+
+        const exe_path = try std.fs.path.join(global.arena, &.{
+            p_path,
+            entry.name,
+            comptime exe_str ++ builtin.target.exeFileExt(),
+        });
+        std.fs.cwd().access(exe_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => |e| return e,
+        };
+        var child = std.process.Child.init(&.{ exe_path, "version" }, global.arena);
+        child.stdout_behavior = .Pipe;
+        child.spawn() catch continue; // probably not a valid zig
+
+        const child_stdout = try child.stdout.?.reader().readAllAlloc(global.arena, 100);
+        defer global.arena.free(child_stdout);
+        const result = try child.wait();
+        if (result != .Exited or result.Exited != 0) {
+            // must not be a zig
+            continue;
+        }
+        const version_str = std.mem.trimRight(u8, child_stdout, "\r\n");
+        const semantic_version = SemanticVersion.parse(version_str) orelse continue;
+        const hashstore_name = std.fmt.allocPrint(global.arena, exe_str ++ "-{}", .{semantic_version}) catch |e| oom(e);
+        defer global.arena.free(hashstore_name);
+        const maybe_hash = maybeHashAndPath(try hashstore.find(hashstore_path, hashstore_name));
+        if (maybe_hash) |*anyzig_store_hash| {
+            if (!anyzig_store_hash.val.eql(&hash_from_cache)) {
+                log.err(
+                    "{s} hash differs!\nglobal-cache:{s}\nanyzig-store:{s}\n",
+                    .{ hashstore_name, entry.name, anyzig_store_hash.val.toSlice() },
+                );
+                continue;
+                // try hashstore.delete(hashstore_path, hashstore_name);
+                // try hashstore.save(hashstore_path, hashstore_name, hash.val.toSlice());
+            }
+        } else {
+            // TODO: should we just trust the hash is good?
+            log.info("new hash added to anyzig store: {s}", .{entry.name});
+            try hashstore.save(hashstore_path, hashstore_name, entry.name);
+        }
+        try listVersion(p_path, semantic_version, entry.name);
+    }
+}
+
+fn listVersion(p_path: []const u8, version: SemanticVersion, hash: []const u8) !void {
+    const stdout = io.getStdOut().writer();
+    try stdout.print("{}\t{s}{s}{s}\n", .{ version, p_path, std.fs.path.sep_str, hash });
+}
+
+pub const SemanticVersion = struct {
     const max_pre = 50;
     const max_build = 50;
     const max_string = 50 + max_pre + max_build;
