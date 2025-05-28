@@ -533,7 +533,9 @@ fn anyCommandUsage() !u8 {
             "  zig any set-verbosity LEVEL    | sets the default system-wide verbosity\n" ++
             "                                 | accepts 'warn' or 'debug\n" ++
             "  zig any version                | print the version of anyzig to stdout\n" ++
-            "  zig any list-installed         | list all versions of zig installed in the global cache\n",
+            "  zig any list-installed         | list all versions of zig installed in the global cache\n" ++
+            "  zig any remove VERSION         | remove a specific version of zig\n" ++
+            "  zig any remove all             | remove all versions of zig\n",
         .{@embedFile("version")},
     );
     return 0xff;
@@ -577,7 +579,105 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
         if (args.len != 0) errExit("the 'list-installed' subcommand does not take any cmdline args", .{});
         try listInstalled();
         return 0;
-    } else errExit("unknown zig any '{s}' command", .{command});
+    } else if (std.mem.eql(u8, command, "remove")) {
+        // no arg
+        if (args.len == 0) errExit("missing version or 'all'", .{});
+        if (args.len != 1) errExit("too many cmdline args", .{});
+
+        // allocate once here to avoid reallocating when looping in removeAllReleases
+        const app_data_dir = try global.getAppDataDir();
+        const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_dir, "hashstore" });
+        // no need to free
+
+        // `all` should this require confirmation??
+        if (std.mem.eql(u8, args[0], "all")) {
+            try removeAllReleases(hashstore_path);
+            return 0;
+        }
+        // <version>
+        const version = VersionSpecifier.parse(args[0]) orelse {
+            errExit("invalid version format '{s}'", .{args[0]});
+        };
+        // in removeAllReleases we grab it from the dir irteration directly
+        // here it needs to be allocated from args
+        const version_name = std.fmt.allocPrint(global.arena, "{s}-{}", .{ exe_str, version.semantic }) catch |e| oom(e);
+        defer global.arena.free(version_name);
+        const maybe_hash = try hashstore.find(hashstore_path, version_name);
+        try removeRelease(version.semantic, hashstore_path, maybe_hash, version_name);
+        return 0;
+    } else {
+        // we should probably print the usage here for convenience
+        // this follows zig compiler convention too
+        _ = try anyCommandUsage();
+        errExit("unknown any command: '{s}'", .{command});
+    }
+}
+
+// removeRelease is passed owned versions and paths to avoid reallocating when looping in removeAllReleases
+fn removeRelease(version: SemanticVersion, hashstore_path: []const u8, maybe_hash: ?Package.Hash, version_name: []const u8) !void {
+    if (maybe_hash == null) {
+        errExit("version '{}' is not installed", .{version});
+    }
+
+    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
+    var global_cache_directory: Directory = .{
+        .handle = try fs.cwd().makeOpenPath(
+            override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena),
+            .{},
+        ),
+        .path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena),
+    };
+    defer global_cache_directory.handle.close();
+
+    // Remove from global cache is done first
+    // This is to aid concurrency as it is more likely to fail
+    const hash = hashAndPath(maybe_hash.?);
+    try global_cache_directory.handle.deleteTree(hash.path());
+
+    // Remove from hashstore second
+    // Additional error logging to warn user about possible concurrency issues
+    // TODO: would it be worth re-adding the version to the hashstore if the delete fails?
+    hashstore.delete(hashstore_path, version_name) catch |err| {
+        log.err("A concurrency issue arose: the version files were already removed from the global cache", .{});
+        errExit("Failed to remove version from hashstore: {s}", .{@errorName(err)});
+    };
+
+    log.info("removed version '{}'", .{version});
+}
+
+// should we use batch processing here?
+// this is slow it would be much faster to to this in parallel
+fn removeAllReleases(hashstore_path: []const u8) !void {
+    try hashstore.init(hashstore_path);
+
+    var dir = try std.fs.cwd().openDir(hashstore_path, .{ .iterate = true });
+    defer dir.close();
+
+    var found_any = false;
+    var it = dir.iterate();
+    while (it.next() catch |err| {
+        errExit("Failed to read hashstore directory: {s}", .{@errorName(err)});
+    }) |entry| {
+        if (entry.kind != .file) continue;
+
+        const version_name = entry.name;
+        if (!std.mem.startsWith(u8, version_name, exe_str ++ "-")) continue;
+
+        // Extract version from name (remove prefix)
+        const version_str = version_name[exe_str.len + 1 ..];
+        const version = SemanticVersion.parse(version_str) orelse {
+            log.debug("Skipping due to invalid version naming: {s}", .{version_name});
+            continue;
+        };
+
+        const maybe_hash = try hashstore.find(hashstore_path, version_name);
+        try removeRelease(version, hashstore_path, maybe_hash, version_name);
+        found_any = true;
+    }
+
+    if (!found_any) {
+        log.info("no versions installed", .{});
+    }
 }
 
 fn listInstalled() !void {
