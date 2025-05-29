@@ -534,8 +534,9 @@ fn anyCommandUsage() !u8 {
             "                                 | accepts 'warn' or 'debug\n" ++
             "  zig any version                | print the version of anyzig to stdout\n" ++
             "  zig any list-installed         | list all versions of zig installed in the global cache\n" ++
-            "  zig any remove VERSION         | remove a specific version of zig\n" ++
-            "  zig any remove all             | remove all versions of zig\n",
+            "  zig any remove VERSION         | force remove a specific version of zig\n" ++
+            "  zig any keep VERSION           | prevent a specific version of zig from being removed\n" ++
+            "  zig any clean                  | remove all versions of zig not marked as 'keep'\n",
         .{@embedFile("version")},
     );
     return 0xff;
@@ -589,27 +590,129 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
         const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_dir, "hashstore" });
         // no need to free
 
-        // `all` should this require confirmation??
-        if (std.mem.eql(u8, args[0], "all")) {
-            try removeAllReleases(hashstore_path);
-            return 0;
-        }
         // <version>
         const version = VersionSpecifier.parse(args[0]) orelse {
             errExit("invalid version format '{s}'", .{args[0]});
         };
-        // in removeAllReleases we grab it from the dir irteration directly
-        // here it needs to be allocated from args
+
         const version_name = std.fmt.allocPrint(global.arena, "{s}-{}", .{ exe_str, version.semantic }) catch |e| oom(e);
         defer global.arena.free(version_name);
         const maybe_hash = try hashstore.find(hashstore_path, version_name);
         try removeRelease(version.semantic, hashstore_path, maybe_hash, version_name);
+        return 0;
+    } else if (std.mem.eql(u8, command, "clean")) {
+        // no arg
+        if (args.len == 0) errExit("missing version or 'all'", .{});
+        if (args.len != 1) errExit("too many cmdline args", .{});
+
+        // allocate once here to avoid reallocating when looping in removeAllReleases
+        const app_data_dir = try global.getAppDataDir();
+        const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_dir, "hashstore" });
+        // no need to free
+
+        try removeAllReleases(hashstore_path);
+        return 0;
+    } else if (std.mem.eql(u8, command, "keep")) {
+        if (args.len == 0) errExit("missing version", .{});
+        if (args.len != 1) errExit("too many cmdline args", .{});
+        const version = VersionSpecifier.parse(args[0]) orelse {
+            errExit("invalid version format '{s}'", .{args[0]});
+        };
+        try keepCompiler(version.semantic);
         return 0;
     } else {
         // we should probably print the usage here for convenience
         // this follows zig compiler convention too
         _ = try anyCommandUsage();
         errExit("unknown any command: '{s}'", .{command});
+    }
+}
+
+fn keepCompiler(version: SemanticVersion) !void {
+    const version_name = std.fmt.allocPrint(global.arena, "{s}-{}", .{ exe_str, version }) catch |e| oom(e);
+    defer global.arena.free(version_name);
+
+    // Check the hashstore for the version
+    const app_data_dir = try global.getAppDataDir();
+    const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_dir, "hashstore" });
+    try hashstore.init(hashstore_path);
+    const maybe_hash = try hashstore.find(hashstore_path, version_name);
+    if (maybe_hash == null) {
+        errExit("version '{}' is not installed", .{version});
+    }
+
+    // Get the actual global cache directory that Zig uses
+    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
+    const global_cache_dir_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
+
+    // Create keep file in the version's directory
+    const hash = hashAndPath(maybe_hash.?);
+    const keep_file_path = try std.fs.path.join(global.arena, &.{ global_cache_dir_path, hash.path(), "keep" });
+    defer global.arena.free(keep_file_path);
+
+    // Check if keep file already exists
+    if (std.fs.cwd().access(keep_file_path, .{})) |_| {
+        log.info("keep file already exists, overwriting", .{});
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| errExit("failed to check keep file: {s}", .{@errorName(e)}),
+    }
+
+    const keep_file = try std.fs.cwd().createFile(keep_file_path, .{});
+    defer keep_file.close();
+
+    try keep_file.writeAll(version_name);
+    log.info("created keep file for version '{}' at '{s}'", .{ version, keep_file_path });
+}
+
+// should we use batch processing here?
+// this is slow it would be much faster to do this in parallel
+fn removeAllReleases(hashstore_path: []const u8) !void {
+    try hashstore.init(hashstore_path);
+
+    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
+    const global_cache_dir_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
+
+    var dir = try std.fs.cwd().openDir(hashstore_path, .{ .iterate = true });
+    defer dir.close();
+
+    var found_any = false;
+    var it = dir.iterate();
+    while (it.next() catch |err| {
+        errExit("Failed to read hashstore directory: {s}", .{@errorName(err)});
+    }) |entry| {
+        if (entry.kind != .file) continue;
+        const version_name = entry.name;
+        if (!std.mem.startsWith(u8, version_name, exe_str ++ "-")) continue;
+
+        // Extract version from name (remove prefix)
+        const version_str = version_name[exe_str.len + 1 ..];
+        const version = SemanticVersion.parse(version_str) orelse {
+            log.debug("Skipping due to invalid version naming: {s}", .{version_name});
+            continue;
+        };
+
+        const maybe_hash = try hashstore.find(hashstore_path, version_name);
+        if (maybe_hash) |hash| {
+            // Check if there's a keep file for this version in the global cache
+            const hash_path = hashAndPath(hash);
+            const keep_file_path = try std.fs.path.join(global.arena, &.{ global_cache_dir_path, hash_path.path(), "keep" });
+            defer global.arena.free(keep_file_path);
+            if (std.fs.cwd().access(keep_file_path, .{})) |_| {
+                log.info("Skipping version '{s}' as it is marked to keep", .{version_name});
+                continue;
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => |e| errExit("failed to check keep file: {s}", .{@errorName(e)}),
+            }
+        }
+
+        try removeRelease(version, hashstore_path, maybe_hash, version_name);
+        found_any = true;
+    }
+
+    if (!found_any) {
+        log.info("no versions installed", .{});
     }
 }
 
@@ -643,41 +746,6 @@ fn removeRelease(version: SemanticVersion, hashstore_path: []const u8, maybe_has
     };
 
     log.info("removed version '{}'", .{version});
-}
-
-// should we use batch processing here?
-// this is slow it would be much faster to to this in parallel
-fn removeAllReleases(hashstore_path: []const u8) !void {
-    try hashstore.init(hashstore_path);
-
-    var dir = try std.fs.cwd().openDir(hashstore_path, .{ .iterate = true });
-    defer dir.close();
-
-    var found_any = false;
-    var it = dir.iterate();
-    while (it.next() catch |err| {
-        errExit("Failed to read hashstore directory: {s}", .{@errorName(err)});
-    }) |entry| {
-        if (entry.kind != .file) continue;
-
-        const version_name = entry.name;
-        if (!std.mem.startsWith(u8, version_name, exe_str ++ "-")) continue;
-
-        // Extract version from name (remove prefix)
-        const version_str = version_name[exe_str.len + 1 ..];
-        const version = SemanticVersion.parse(version_str) orelse {
-            log.debug("Skipping due to invalid version naming: {s}", .{version_name});
-            continue;
-        };
-
-        const maybe_hash = try hashstore.find(hashstore_path, version_name);
-        try removeRelease(version, hashstore_path, maybe_hash, version_name);
-        found_any = true;
-    }
-
-    if (!found_any) {
-        log.info("no versions installed", .{});
-    }
 }
 
 fn listInstalled() !void {
