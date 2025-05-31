@@ -292,11 +292,17 @@ pub fn main() !void {
     const all_args = try std.process.argsAlloc(arena);
     defer arena.free(all_args);
 
-    const argv_index: usize, const manual_version: ?VersionSpecifier = blk: {
+    const argv_index: usize = blk: {
         if (all_args.len >= 2) {
-            if (VersionSpecifier.parse(all_args[1])) |v| break :blk .{ 2, v };
+            if (VersionSpecifier.parse(all_args[1])) |_| {
+                try std.io.getStdErr().writer().print(
+                    "error: '{s}' is not a recognized command\n",
+                    .{all_args[1]},
+                );
+                std.process.exit(0xff);
+            }
         }
-        break :blk .{ 1, null };
+        break :blk 1;
     };
 
     const maybe_command: ?[]const u8 = if (argv_index >= all_args.len) null else all_args[argv_index];
@@ -334,26 +340,35 @@ pub fn main() !void {
                 );
                 std.process.exit(0xff);
             }
-            if (build_options.exe == .zig and (std.mem.eql(u8, command, "init") or std.mem.eql(u8, command, "init-exe") or std.mem.eql(u8, command, "init-lib"))) {
-                if (manual_version) |version| break :blk .{ version, true };
-                try std.io.getStdErr().writer().print(
-                    "error: anyzig init requires a version, i.e. 'zig 0.13.0 {s}'\n",
-                    .{command},
-                );
-                std.process.exit(0xff);
-            }
             if (std.mem.eql(u8, command, "any")) {
+                if (build_options.exe == .zig and (std.mem.eql(u8, command, "init") or std.mem.eql(u8, command, "init-exe") or std.mem.eql(u8, command, "init-lib"))) {
+                    if (argv_index + 1 >= all_args.len) {
+                        try std.io.getStdErr().writer().print(
+                            "error: anyzig init requires a version, i.e. 'zig any download 0.13.0'\n",
+                            .{},
+                        );
+                        std.process.exit(0xff);
+                    }
+                    const version_str = all_args[argv_index + 1];
+                    const version = VersionSpecifier.parse(version_str) orelse {
+                        try std.io.getStdErr().writer().print(
+                            "error: invalid version '{s}'\n",
+                            .{version_str},
+                        );
+                        std.process.exit(0xff);
+                    };
+                    break :blk .{ version, true };
+                }
                 if (argv_index + 1 == all_args.len) {
                     std.process.exit(try anyCommandUsage());
                 }
                 std.process.exit(try anyCommand(all_args[argv_index + 1], all_args[argv_index + 2 ..]));
             }
         }
-        if (manual_version) |version| break :blk .{ version, false };
         const build_root = try findBuildRoot(arena, build_root_options) orelse {
             try std.io.getStdErr().writeAll(
                 "no build.zig to pull a zig version from, you can:\n" ++
-                    "  1. run '" ++ exe_str ++ " VERSION' to specify a version\n" ++
+                    "  1. run '" ++ exe_str ++ " any download VERSION' to download a version\n" ++
                     "  2. run from a directory where a build.zig can be found\n",
             );
             std.process.exit(0xff);
@@ -533,7 +548,8 @@ fn anyCommandUsage() !u8 {
             "  zig any set-verbosity LEVEL    | sets the default system-wide verbosity\n" ++
             "                                 | accepts 'warn' or 'debug\n" ++
             "  zig any version                | print the version of anyzig to stdout\n" ++
-            "  zig any list-installed         | list all versions of zig installed in the global cache\n",
+            "  zig any list-installed         | list all versions of zig installed in the global cache\n" ++
+            "  zig any download VERSION       | download a specific version of zig\n",
         .{@embedFile("version")},
     );
     return 0xff;
@@ -576,6 +592,85 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
     } else if (std.mem.eql(u8, command, "list-installed")) {
         if (args.len != 0) errExit("the 'list-installed' subcommand does not take any cmdline args", .{});
         try listInstalled();
+        return 0;
+    } else if (std.mem.eql(u8, command, "download")) {
+        if (args.len == 0) errExit("missing VERSION to download", .{});
+        if (args.len != 1) errExit("too many cmdline args", .{});
+        const version_str = args[0];
+        const version_specifier = VersionSpecifier.parse(version_str) orelse errExit(
+            "invalid version '{s}'",
+            .{version_str},
+        );
+        const semantic_version = semantic_version: switch (version_specifier) {
+            .semantic => |v| v,
+            .master => {
+                const download_index_kind: DownloadIndexKind = .official;
+                const index_path = try std.fs.path.join(global.arena, &.{ try global.getAppDataDir(), download_index_kind.basename() });
+                defer global.arena.free(index_path);
+                try downloadFile(global.arena, download_index_kind.url(), index_path);
+                const index_content = blk: {
+                    const file = try std.fs.cwd().openFile(index_path, .{});
+                    defer file.close();
+                    break :blk try file.readToEndAlloc(global.arena, std.math.maxInt(usize));
+                };
+                defer global.arena.free(index_content);
+                break :semantic_version extractMasterVersion(global.arena, index_path, index_content);
+            },
+        };
+
+        const hashstore_path = try std.fs.path.join(global.arena, &.{ try global.getAppDataDir(), "hashstore" });
+        try hashstore.init(hashstore_path);
+
+        const hashstore_name = std.fmt.allocPrint(global.arena, exe_str ++ "-{}", .{semantic_version}) catch |e| oom(e);
+
+        const maybe_hash = maybeHashAndPath(try hashstore.find(hashstore_path, hashstore_name));
+
+        const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
+        var global_cache_directory: Directory = l: {
+            const p = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
+            break :l .{
+                .handle = try fs.cwd().makeOpenPath(p, .{}),
+                .path = p,
+            };
+        };
+        defer global_cache_directory.handle.close();
+
+        if (maybe_hash) |hash| {
+            if (global_cache_directory.handle.access(hash.path(), .{})) |_| {
+                log.info(
+                    "{s} '{}' already exists at '{}{s}'",
+                    .{ @tagName(build_options.exe), semantic_version, global_cache_directory, hash.path() },
+                );
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => |e| return e,
+            }
+        }
+
+        const url = try getVersionUrl(global.arena, try global.getAppDataDir(), semantic_version);
+        defer url.deinit(global.arena);
+        const hash = hashAndPath(try cmdFetch(
+            global.gpa,
+            global.arena,
+            global_cache_directory,
+            url.fetch,
+            .{ .debug_hash = false },
+        ));
+        log.info("downloaded {s} to '{}{s}'", .{ hashstore_name, global_cache_directory, hash.path() });
+        if (maybe_hash) |*previous_hash| {
+            if (previous_hash.val.eql(&hash.val)) {
+                log.info("{s} was already in the hashstore as {s}", .{ hashstore_name, hash.val.toSlice() });
+            } else {
+                log.warn(
+                    "{s} hash has changed!\nold:{s}\nnew:{s}\n",
+                    .{ hashstore_name, previous_hash.val.toSlice(), hash.val.toSlice() },
+                );
+                try hashstore.delete(hashstore_path, hashstore_name);
+                try hashstore.save(hashstore_path, hashstore_name, hash.val.toSlice());
+            }
+        } else {
+            try hashstore.save(hashstore_path, hashstore_name, hash.val.toSlice());
+        }
         return 0;
     } else errExit("unknown zig any '{s}' command", .{command});
 }
