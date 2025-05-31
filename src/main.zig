@@ -292,18 +292,7 @@ pub fn main() !void {
     const all_args = try std.process.argsAlloc(arena);
     defer arena.free(all_args);
 
-    const argv_index: usize = blk: {
-        if (all_args.len >= 2) {
-            if (VersionSpecifier.parse(all_args[1])) |_| {
-                try std.io.getStdErr().writer().print(
-                    "error: '{s}' is not a recognized command\n",
-                    .{all_args[1]},
-                );
-                std.process.exit(0xff);
-            }
-        }
-        break :blk 1;
-    };
+    const argv_index: usize = 1;
 
     const maybe_command: ?[]const u8 = if (argv_index >= all_args.len) null else all_args[argv_index];
 
@@ -482,6 +471,13 @@ pub fn main() !void {
             .Exited => |code| if (code != 0) std.process.exit(0xff),
             else => std.process.exit(0xff),
         }
+    }
+
+    if (maybe_command == null) {
+        try std.io.getStdErr().writeAll("Usage: " ++ exe_str ++ " [COMMAND] [ARGS...]\n" ++
+            "  Run 'zig any' for anyzig-specific commands\n" ++
+            "  Run 'zig --help' for zig-specific commands\n");
+        std.process.exit(0xff);
     }
 
     if (is_init) {
@@ -1243,7 +1239,9 @@ pub fn cmdFetch(
     };
     defer fetch.deinit();
 
-    log.info("downloading '{s}'...", .{url});
+    const stdout = std.io.getStdOut().writer();
+    stdout.print("downloading '{s}'...\n", .{url}) catch {};
+
     fetch.run() catch |err| switch (err) {
         error.OutOfMemory => errExit("out of memory", .{}),
         error.FetchFailed => {}, // error bundle checked below
