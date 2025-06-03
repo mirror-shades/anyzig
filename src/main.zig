@@ -333,8 +333,8 @@ pub fn main() !void {
                 if (build_options.exe == .zig and (std.mem.eql(u8, command, "init") or std.mem.eql(u8, command, "init-exe") or std.mem.eql(u8, command, "init-lib"))) {
                     if (argv_index + 1 >= all_args.len) {
                         try std.io.getStdErr().writer().print(
-                            "error: anyzig init requires a version, i.e. 'zig any download 0.13.0'\n",
-                            .{},
+                            "error: anyzig init requires a version, i.e. 'zig 0.13.0 {s}'\n",
+                            .{command},
                         );
                         std.process.exit(0xff);
                     }
