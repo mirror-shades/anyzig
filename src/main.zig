@@ -536,7 +536,7 @@ fn anyCommandUsage() !u8 {
             "  zig any list-installed         | list all versions of zig installed in the global cache\n" ++
             "  zig any keep VERSION           | prevent a specific version of zig from being removed\n" ++
             "  zig any clean                  | remove all versions of zig not marked as 'kept'\n" ++
-            "  zig any force-remove VERSION   | remove a specific version of zig (even if 'kept')\n",
+            "  zig any clean VERSION          | remove a specific version of zig\n",
         .{@embedFile("version")},
     );
     return 0xff;
@@ -580,35 +580,35 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
         if (args.len != 0) errExit("the 'list-installed' subcommand does not take any cmdline args", .{});
         try listInstalled();
         return 0;
-    } else if (std.mem.eql(u8, command, "force-remove")) {
-        if (args.len == 0) errExit("missing version", .{});
-        if (args.len != 1) errExit("too many cmdline args", .{});
-
-        const app_data_dir = try global.getAppDataDir();
-        const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_dir, "hashstore" });
-        const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
-        const global_cache_dir_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
-
-        // <version>
-        const version = VersionSpecifier.parse(args[0]) orelse {
-            errExit("invalid version format '{s}'", .{args[0]});
-        };
-
-        const version_name = std.fmt.allocPrint(global.arena, "{s}-{}", .{ exe_str, version.semantic }) catch |e| oom(e);
-        defer global.arena.free(version_name);
-        const maybe_hash = try hashstore.find(hashstore_path, version_name);
-        try removeRelease(global_cache_dir_path, hashstore_path, maybe_hash, version_name);
-        return 0;
     } else if (std.mem.eql(u8, command, "clean")) {
-        if (args.len != 0) errExit("the 'clean' subcommand does not take any cmdline args", .{});
+        if (args.len == 0) {
+            const app_data_dir = try global.getAppDataDir();
+            const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_dir, "hashstore" });
+            const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
+            const global_cache_dir_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
 
-        const app_data_dir = try global.getAppDataDir();
-        const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_dir, "hashstore" });
-        const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
-        const global_cache_dir_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
+            try cleanReleases(global_cache_dir_path, hashstore_path);
+            return 0;
+        } else if (args.len == 1) {
+            // <version>
+            const version = VersionSpecifier.parse(args[0]) orelse {
+                errExit("invalid version format '{s}'", .{args[0]});
+            };
 
-        try cleanReleases(global_cache_dir_path, hashstore_path);
-        return 0;
+            const app_data_dir = try global.getAppDataDir();
+            const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_dir, "hashstore" });
+            const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
+            const global_cache_dir_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
+
+            const version_name = std.fmt.allocPrint(global.arena, "{s}-{}", .{ exe_str, version.semantic }) catch |e| oom(e);
+            defer global.arena.free(version_name);
+            const maybe_hash = try hashstore.find(hashstore_path, version_name);
+            try removeRelease(global_cache_dir_path, hashstore_path, maybe_hash, version_name);
+            return 0;
+        } else {
+            _ = try anyCommandUsage();
+            errExit("too many cmdline args", .{});
+        }
     } else if (std.mem.eql(u8, command, "keep")) {
         if (args.len == 0) errExit("missing version", .{});
         if (args.len != 1) errExit("too many cmdline args", .{});
@@ -708,6 +708,11 @@ fn cleanReleases(global_cache_dir_path: []const u8, hashstore_path: []const u8) 
 // removeRelease is passed owned versions and paths to avoid reallocating when looping in cleanReleases
 // it does not need to check for the keep file as this is handled in cleanReleases
 fn removeRelease(global_cache_dir_path: []const u8, hashstore_path: []const u8, maybe_hash: ?Package.Hash, version_name: []const u8) !void {
+    // Check if version exists in hashstore
+    if (maybe_hash == null) {
+        errExit("version '{s}' not found in hashstore", .{version_name});
+    }
+
     // Remove from global cache is done first
     // This is to aid concurrency as it is more likely to fail
     const hash = hashAndPath(maybe_hash.?);
