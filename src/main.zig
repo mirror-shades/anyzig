@@ -625,7 +625,7 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
     }
 }
 
-// places a file called 'keep' in the version's directory to prevent it from being removed
+// places a file in the kept_versions directory to prevent it from being removed
 fn keepCompiler(version: SemanticVersion) !void {
     const version_name = std.fmt.allocPrint(global.arena, "{s}-{}", .{ exe_str, version }) catch |e| oom(e);
     defer global.arena.free(version_name);
@@ -639,21 +639,18 @@ fn keepCompiler(version: SemanticVersion) !void {
         errExit("version '{}' is not installed", .{version});
     }
 
-    // Get the actual global cache directory that Zig uses
-    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
-    const global_cache_dir_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
+    // Create kept_versions directory in anyzig app data
+    const kept_versions_dir = try std.fs.path.join(global.arena, &.{ app_data_dir, "kept_versions" });
+    defer global.arena.free(kept_versions_dir);
+    try std.fs.cwd().makePath(kept_versions_dir);
 
-    // Create keep file in the version's directory
-    const hash = hashAndPath(maybe_hash.?);
-    const keep_file_path = try std.fs.path.join(global.arena, &.{ global_cache_dir_path, hash.path(), "keep" });
+    // Create keep file in the kept_versions directory
+    const keep_file_path = try std.fs.path.join(global.arena, &.{ kept_versions_dir, version_name });
     defer global.arena.free(keep_file_path);
 
-    // Check if keep file already exists
-    if (std.fs.cwd().access(keep_file_path, .{})) |_| {
+    // Check if keep file already exists - simplified!
+    if (isVersionKept(version_name)) {
         log.info("keep file already exists, overwriting", .{});
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => |e| errExit("failed to check keep file: {s}", .{@errorName(e)}),
     }
 
     const keep_file = try std.fs.cwd().createFile(keep_file_path, .{});
@@ -681,21 +678,12 @@ fn cleanReleases(global_cache_dir_path: []const u8, hashstore_path: []const u8) 
         if (!std.mem.startsWith(u8, version_name, exe_str ++ "-")) continue;
 
         // check if the version is marked as 'kept'
-        const maybe_hash = try hashstore.find(hashstore_path, version_name);
-        if (maybe_hash) |hash| {
-            const hash_path = hashAndPath(hash);
-            const keep_file_path = try std.fs.path.join(global.arena, &.{ global_cache_dir_path, hash_path.path(), "keep" });
-            defer global.arena.free(keep_file_path);
-
-            if (std.fs.cwd().access(keep_file_path, .{})) |_| {
-                log.info("Skipping version '{s}' as it is marked to keep", .{version_name});
-                continue;
-            } else |err| switch (err) {
-                error.FileNotFound => {},
-                else => |e| errExit("failed to check keep file: {s}", .{@errorName(e)}),
-            }
+        if (isVersionKept(version_name)) {
+            log.info("Skipping version '{s}' as it is marked to keep", .{version_name});
+            continue;
         }
 
+        const maybe_hash = try hashstore.find(hashstore_path, version_name);
         try removeRelease(global_cache_dir_path, hashstore_path, maybe_hash, version_name);
         found_any = true;
     }
@@ -706,7 +694,6 @@ fn cleanReleases(global_cache_dir_path: []const u8, hashstore_path: []const u8) 
 }
 
 // removeRelease is passed owned versions and paths to avoid reallocating when looping in cleanReleases
-// it does not need to check for the keep file as this is handled in cleanReleases
 fn removeRelease(global_cache_dir_path: []const u8, hashstore_path: []const u8, maybe_hash: ?Package.Hash, version_name: []const u8) !void {
     // Check if version exists in hashstore
     if (maybe_hash == null) {
@@ -725,6 +712,26 @@ fn removeRelease(global_cache_dir_path: []const u8, hashstore_path: []const u8, 
         log.err("A concurrency issue arose: the version files were already removed from the global cache", .{});
         errExit("Failed to remove version from hashstore: {s}", .{@errorName(err)});
     };
+
+    // Remove keep file if it exists
+    if (isVersionKept(version_name)) {
+        const app_data_dir = global.getAppDataDir() catch {
+            log.warn("could not get app data dir to remove keep file", .{});
+            log.info("removed version '{s}'", .{version_name});
+            return;
+        };
+        const keep_file_path = std.fs.path.join(global.arena, &.{ app_data_dir, "kept_versions", version_name }) catch {
+            log.warn("could not construct keep file path", .{});
+            log.info("removed version '{s}'", .{version_name});
+            return;
+        };
+        defer global.arena.free(keep_file_path);
+
+        std.fs.cwd().deleteFile(keep_file_path) catch |err| {
+            log.warn("failed to remove keep file '{s}': {s}", .{ keep_file_path, @errorName(err) });
+        };
+        log.info("removed keep file for version '{s}'", .{version_name});
+    }
 
     log.info("removed version '{s}'", .{version_name});
 }
@@ -809,20 +816,21 @@ fn listInstalled() !void {
     }
 }
 
+fn isVersionKept(version_name: []const u8) bool {
+    const app_data_dir = global.getAppDataDir() catch return false;
+    const keep_file_path = std.fs.path.join(global.arena, &.{ app_data_dir, "kept_versions", version_name }) catch return false;
+    defer global.arena.free(keep_file_path);
+
+    std.fs.cwd().access(keep_file_path, .{}) catch return false;
+    return true;
+}
+
 fn listVersion(p_path: []const u8, version: SemanticVersion, hash: []const u8) !void {
     const stdout = io.getStdOut().writer();
 
-    // Check for keep file
-    const keep_file_path = try std.fs.path.join(global.arena, &.{ p_path, hash, "keep" });
-    defer global.arena.free(keep_file_path);
-
-    const is_kept = blk: {
-        std.fs.cwd().access(keep_file_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => break :blk false,
-            else => |e| errExit("failed to check keep file: {s}", .{@errorName(e)}),
-        };
-        break :blk true;
-    };
+    const version_name = std.fmt.allocPrint(global.arena, "{s}-{}", .{ exe_str, version }) catch |e| oom(e);
+    defer global.arena.free(version_name);
+    const is_kept = isVersionKept(version_name);
 
     try stdout.print("{}{s}\t{s}{s}{s}\n", .{
         version,
