@@ -609,6 +609,15 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
             _ = try anyCommandUsage();
             errExit("too many cmdline args", .{});
         }
+    } else if (std.mem.eql(u8, command, "update")) {
+        if (args.len != 0) errExit("the 'update' subcommand does not take any cmdline args", .{});
+        const latest_version = try updateAvailable();
+        if (latest_version == null) {
+            try std.io.getStdOut().writer().print("Latest version is currently installed\n", .{});
+        } else {
+            try std.io.getStdOut().writer().print("New version is available {any}\n", .{latest_version});
+        }
+        return 0;
     } else if (std.mem.eql(u8, command, "keep")) {
         if (args.len == 0) errExit("missing version", .{});
         if (args.len != 1) errExit("too many cmdline args", .{});
@@ -623,6 +632,124 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
         _ = try anyCommandUsage();
         errExit("unknown any command: '{s}'", .{command});
     }
+}
+
+fn updateAvailable() !?[]const u8 {
+    // grab current version from the embed file
+    const current_version_dirty = @embedFile("version");
+    const current_version_stripped = current_version_dirty[1..current_version_dirty.len];
+    const dashIndex = std.mem.indexOf(u8, current_version_stripped, "-") orelse current_version_stripped.len;
+    const current_version_clean = current_version_stripped[0..dashIndex];
+
+    // curl the latest version from marler8997/anyzig
+    // would be worth adding backups if this fails?
+    const url = "https://api.github.com/repos/marler8997/anyzig/releases/latest";
+
+    // retry up to 3 times, 1 second delay
+    var latest_version: ?[]const u8 = null;
+    var attempts: u8 = 0;
+    while (attempts < 3) : (attempts += 1) {
+        latest_version = curlLatestVersion(url) catch continue;
+        if (latest_version != null) break;
+        if (attempts == 2) return error.FailedToCurlLatestVersion; // Final attempt
+        std.time.sleep(std.time.ns_per_ms * 1000); // 1 second delay
+    }
+
+    if (latest_version != null) {
+        const date_a = parseDateString(current_version_clean);
+        const date_b = parseDateString(latest_version.?);
+
+        var compare_versions: ?std.math.Order = null;
+
+        if (date_a.year != date_b.year) {
+            compare_versions = std.math.order(date_a.year, date_b.year);
+        } else if (date_a.month != date_b.month) {
+            compare_versions = std.math.order(date_a.month, date_b.month);
+        } else {
+            compare_versions = std.math.order(date_a.day, date_b.day);
+        }
+
+        if (compare_versions == null) {
+            std.debug.panic("compare_versions is null", .{});
+        }
+
+        // if there is a newer version available, return the latest version
+        if (compare_versions == .lt) {
+            return latest_version.?;
+        } else {
+            return null;
+        }
+    } else {
+        return error.FailedToCurlLatestVersion;
+    }
+}
+
+const Date = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+};
+
+fn parseDateString(date_str: []const u8) Date {
+    // first 4 digits will always be the year, grab the separator here
+    const separator = date_str[4..5];
+    const index = std.mem.indexOf(u8, date_str, separator);
+    if (index == null) {
+        std.debug.panic("Invalid date string: {s}", .{date_str});
+    }
+
+    var parts = std.mem.splitScalar(u8, date_str, separator[0]);
+    const year_part = parts.next().?;
+    const month_part = parts.next().?;
+    const day_part = parts.next().?;
+
+    // I don't know of a better way to do this with zig
+    // if there is a std lib funtion to clean this up that would be great
+    const year = std.fmt.parseInt(u16, year_part, 10) catch {
+        std.debug.panic("Invalid year in date string: {s}", .{date_str});
+    };
+    const month = std.fmt.parseInt(u8, month_part, 10) catch {
+        std.debug.panic("Invalid month in date string: {s}", .{date_str});
+    };
+    const day = std.fmt.parseInt(u8, day_part, 10) catch {
+        std.debug.panic("Invalid day in date string: {s}", .{date_str});
+    };
+
+    return Date{ .year = year, .month = month, .day = day };
+}
+
+fn curlLatestVersion(url: []const u8) ![]const u8 {
+    var client = std.http.Client{ .allocator = global.arena };
+    defer client.deinit();
+
+    // should this have retries?
+    // should we add a timeout?
+    // we could cache the result but I don't know if it's worth it for such a small request
+    var header_buffer: [4096]u8 = undefined;
+    var request = client.open(.GET, std.Uri.parse(url) catch |err| return err, .{
+        .server_header_buffer = &header_buffer,
+    }) catch |err| return err;
+    defer request.deinit();
+
+    request.send() catch |err| return err;
+    request.wait() catch |err| return err;
+
+    const result = request.reader().readAllAlloc(global.arena, std.math.maxInt(usize)) catch |err| return err;
+
+    // find the "updated_at" field
+    const updated_at = std.json.parseFromSlice(std.json.Value, global.arena, result, .{
+        .allocate = .alloc_if_needed,
+    }) catch |err| return err;
+    defer updated_at.deinit();
+
+    // manipulate the result to remove the junk
+    // i.e.get "2025-09-28T12:00:00Z" to return as "2025-09-28"
+    const version_timestamp = updated_at.value.object.get("updated_at") orelse return error.JsonMissingUpdatedAt;
+    const version_timestamp_str = version_timestamp.string;
+    // index 'T'. take everthing preceding 'T'
+    const time_index = std.mem.indexOf(u8, version_timestamp_str, "T") orelse return error.JsonMissingT;
+    const version_timestamp_clean = version_timestamp_str[0..time_index];
+    return version_timestamp_clean;
 }
 
 // places a file in the kept_versions directory to prevent it from being removed
