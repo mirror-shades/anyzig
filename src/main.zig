@@ -615,7 +615,7 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
         if (latest_version == null) {
             try std.io.getStdOut().writer().print("Latest version is currently installed\n", .{});
         } else {
-            try std.io.getStdOut().writer().print("New version is available {any}\n", .{latest_version});
+            try std.io.getStdOut().writer().print("Updating to latest version: {s}\n", .{latest_version.?});
         }
         return 0;
     } else if (std.mem.eql(u8, command, "keep")) {
@@ -635,46 +635,32 @@ fn anyCommand(command: []const u8, args: []const []const u8) !u8 {
 }
 
 fn updateAvailable() !?[]const u8 {
-    // grab current version from the embed file
+    // grab current version from the embed file and parse it
     const current_version_dirty = @embedFile("version");
     const current_version_stripped = current_version_dirty[1..current_version_dirty.len];
     const dashIndex = std.mem.indexOf(u8, current_version_stripped, "-") orelse current_version_stripped.len;
     const current_version_clean = current_version_stripped[0..dashIndex];
 
     // curl the latest version from marler8997/anyzig
-    // would be worth adding backups if this fails?
+    // if we have backup hosts we could expand this
     const url = "https://api.github.com/repos/marler8997/anyzig/releases/latest";
 
-    // retry up to 3 times, 1 second delay
+    // retry up to 3 times, 1 second delay between attempts
     var latest_version: ?[]const u8 = null;
     var attempts: u8 = 0;
     while (attempts < 3) : (attempts += 1) {
         latest_version = curlLatestVersion(url) catch continue;
         if (latest_version != null) break;
-        if (attempts == 2) return error.FailedToCurlLatestVersion; // Final attempt
-        std.time.sleep(std.time.ns_per_ms * 1000); // 1 second delay
+        std.time.sleep(std.time.ns_per_ms * 1000);
+        if (attempts == 2) return error.FailedToCurlLatestVersion;
     }
 
     if (latest_version != null) {
-        const date_a = parseDateString(current_version_clean);
-        const date_b = parseDateString(latest_version.?);
-
-        var compare_versions: ?std.math.Order = null;
-
-        if (date_a.year != date_b.year) {
-            compare_versions = std.math.order(date_a.year, date_b.year);
-        } else if (date_a.month != date_b.month) {
-            compare_versions = std.math.order(date_a.month, date_b.month);
-        } else {
-            compare_versions = std.math.order(date_a.day, date_b.day);
-        }
-
-        if (compare_versions == null) {
-            std.debug.panic("compare_versions is null", .{});
-        }
 
         // if there is a newer version available, return the latest version
-        if (compare_versions == .lt) {
+        // !! REVERESED FOR TESTING USE == .lt IN PROD
+        const most_recent_date = compareLatestDate(current_version_clean, latest_version.?);
+        if (std.mem.order(u8, most_recent_date, current_version_clean) != .lt) {
             return latest_version.?;
         } else {
             return null;
@@ -684,38 +670,26 @@ fn updateAvailable() !?[]const u8 {
     }
 }
 
-const Date = struct {
-    year: u16,
-    month: u8,
-    day: u8,
-};
-
-fn parseDateString(date_str: []const u8) Date {
-    // first 4 digits will always be the year, grab the separator here
-    const separator = date_str[4..5];
-    const index = std.mem.indexOf(u8, date_str, separator);
-    if (index == null) {
-        std.debug.panic("Invalid date string: {s}", .{date_str});
-    }
-
-    var parts = std.mem.splitScalar(u8, date_str, separator[0]);
-    const year_part = parts.next().?;
-    const month_part = parts.next().?;
-    const day_part = parts.next().?;
-
-    // I don't know of a better way to do this with zig
-    // if there is a std lib funtion to clean this up that would be great
-    const year = std.fmt.parseInt(u16, year_part, 10) catch {
-        std.debug.panic("Invalid year in date string: {s}", .{date_str});
-    };
-    const month = std.fmt.parseInt(u8, month_part, 10) catch {
-        std.debug.panic("Invalid month in date string: {s}", .{date_str});
-    };
-    const day = std.fmt.parseInt(u8, day_part, 10) catch {
-        std.debug.panic("Invalid day in date string: {s}", .{date_str});
-    };
-
-    return Date{ .year = year, .month = month, .day = day };
+fn compareLatestDate(a: []const u8, b: []const u8) []const u8 {
+    // the date will always be in the format YYYY-MM-DD or YYYY_MM_DD
+    // we can just slice the string directly so that we don't need to parse it
+    const a_year = a[0..4];
+    const a_month = a[5..7];
+    const a_day = a[8..10];
+    const b_year = b[0..4];
+    const b_month = b[5..7];
+    const b_day = b[8..10];
+    // check years
+    if (std.mem.order(u8, a_year, b_year) == .lt) return b;
+    if (std.mem.order(u8, a_year, b_year) == .gt) return a;
+    // then months
+    if (std.mem.order(u8, a_month, b_month) == .lt) return b;
+    if (std.mem.order(u8, a_month, b_month) == .gt) return a;
+    // then days
+    if (std.mem.order(u8, a_day, b_day) == .lt) return b;
+    if (std.mem.order(u8, a_day, b_day) == .gt) return a;
+    // if we reach here it's equal so just return a
+    return a;
 }
 
 fn curlLatestVersion(url: []const u8) ![]const u8 {
