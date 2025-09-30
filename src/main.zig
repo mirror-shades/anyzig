@@ -600,7 +600,120 @@ fn anyCommand(cmdline: Cmdline, cmdline_offset: usize) !u8 {
         if (arg_offset < cmdline.len()) errExit("the 'list-installed' subcommand does not take any cmdline args", .{});
         try listInstalled();
         return 0;
+    } else if (std.mem.eql(u8, command, "update")) {
+        if (arg_offset < cmdline.len()) errExit("the 'version' subcommand does not take any cmdline args", .{});
+        const latest_version = try anyzigUpdateAvailable();
+        if (latest_version == null) {
+            try std.io.getStdOut().writer().print("Latest version is currently installed\n", .{});
+        } else {
+            try updateAnyzig(latest_version.?);
+        }
+        return 0;
     } else errExit("unknown zig any '{s}' command", .{command});
+}
+
+fn updateAnyzig(latest_version: []const u8) !void {
+    try std.io.getStdOut().writer().print("Updating anyzig to {s}\n", .{latest_version});
+
+    const ext = switch (builtin.os.tag) {
+        .windows => "zip",
+        .linux, .macos => "tar.gz",
+        else => @panic("unsupported operating system"),
+    };
+    const base_url = "https://github.com/marler8997/anyzig/releases/download/";
+    const target_arch = @tagName(builtin.cpu.arch);
+    const target_os = @tagName(builtin.os.tag);
+    const target_url = try std.fmt.allocPrint(global.arena, "{s}{s}/{s}-{s}-{s}.{s}", .{ base_url, latest_version, "anyzig", target_arch, target_os, ext });
+    defer global.arena.free(target_url);
+    try std.io.getStdOut().writer().print("Downloading latest version of anyzig from {s}\n", .{target_url});
+}
+
+fn anyzigUpdateAvailable() !?[]const u8 {
+    // grab current version of anyzig from the embed file and parse it
+    const current_version_dirty = @embedFile("version");
+    const current_version_stripped = current_version_dirty[1..current_version_dirty.len];
+    const dash_index = std.mem.indexOf(u8, current_version_stripped, "-") orelse current_version_stripped.len;
+    const current_version_clean = current_version_stripped[0..dash_index];
+
+    // curl the latest version from marler8997/anyzig
+    // if we have backup hosts we could expand this
+    const url = "https://api.github.com/repos/marler8997/anyzig/releases/latest";
+
+    // retry up to 3 times, 1 second delay between attempts
+    var latest_version: ?[]const u8 = null;
+    var attempts: u8 = 0;
+    while (attempts < 3) : (attempts += 1) {
+        latest_version = curlLatestVersion(url) catch continue;
+        if (latest_version != null) break;
+        std.time.sleep(std.time.ns_per_ms * 1000);
+        if (attempts == 2) return error.FailedToCurlLatestVersion;
+    }
+
+    if (latest_version != null) {
+
+        // if there is a newer version available, return the latest version
+        // !! REVERESED FOR TESTING USE == .lt IN PROD
+        const most_recent_date = compareLatestDate(current_version_clean, latest_version.?);
+        if (std.mem.order(u8, most_recent_date, current_version_clean) != .lt) {
+            return latest_version.?;
+        } else {
+            return null;
+        }
+    } else {
+        return error.FailedToCurlLatestVersion;
+    }
+}
+
+fn compareLatestDate(a: []const u8, b: []const u8) []const u8 {
+    // the date will always be in the format YYYY-MM-DD or YYYY_MM_DD
+    // we can just slice the string directly so that we don't need to parse it
+    const a_year = a[0..4];
+    const a_month = a[5..7];
+    const a_day = a[8..10];
+    const b_year = b[0..4];
+    const b_month = b[5..7];
+    const b_day = b[8..10];
+    // check years
+    if (std.mem.order(u8, a_year, b_year) == .lt) return b;
+    if (std.mem.order(u8, a_year, b_year) == .gt) return a;
+    // then months
+    if (std.mem.order(u8, a_month, b_month) == .lt) return b;
+    if (std.mem.order(u8, a_month, b_month) == .gt) return a;
+    // then days
+    if (std.mem.order(u8, a_day, b_day) == .lt) return b;
+    if (std.mem.order(u8, a_day, b_day) == .gt) return a;
+    // if we reach here it's equal so just return a
+    return a;
+}
+
+fn curlLatestVersion(url: []const u8) ![]const u8 {
+    var client = std.http.Client{ .allocator = global.arena };
+    defer client.deinit();
+
+    // we could cache the result but I don't know if it's worth it for such a small request
+    var header_buffer: [4096]u8 = undefined;
+    var request = client.open(.GET, std.Uri.parse(url) catch |err| return err, .{
+        .server_header_buffer = &header_buffer,
+    }) catch |err| return err;
+    defer request.deinit();
+
+    request.send() catch |err| return err;
+    request.wait() catch |err| return err;
+
+    const result = request.reader().readAllAlloc(global.arena, std.math.maxInt(usize)) catch |err| return err;
+
+    // find the "updated_at" field
+    const result_json = std.json.parseFromSlice(std.json.Value, global.arena, result, .{
+        .allocate = .alloc_if_needed,
+    }) catch |err| return err;
+    defer result_json.deinit();
+
+    // find the "created_at" field from latest release
+    // manipulate the result to remove the junk
+    // i.e.get "2025-09-28T12:00:00Z" to return as "2025-09-28"
+    const version_timestamp = result_json.value.object.get("tag_name") orelse return error.JsonMissingUpdatedAt;
+    const version_timestamp_str = version_timestamp.string;
+    return version_timestamp_str;
 }
 
 fn listInstalled() !void {
